@@ -1,0 +1,76 @@
+# Codemagic CI/CD 配置 —— Polaris
+# 流水线结构借鉴自 Rein 项目：https://github.com/Y4s7cyzyfm-png/Rein
+#   无签名编译 → 架构校验 → 打包 .tipa / .ipa（适配 TrollStore / 侧载分发）
+# Codemagic YAML 文档: https://docs.codemagic.io/yaml/yaml-getting-started/
+
+workflows:
+  polaris-tipa:
+    name: Polaris TIPA (arm64)
+    max_build_duration: 60
+    instance_type: mac_mini_m2
+    environment:
+      # 使用最新 Xcode（iOS SDK）
+      xcode: latest
+      vars:
+        BUNDLE_ID: com.polaris.toolkit
+        APP_VERSION: 0.1.0
+    triggering:
+      events:
+        - push
+      branch_patterns:
+        - pattern: "*"
+          include: true
+          source: false
+    scripts:
+      - name: Build Polaris (arm64, unsigned)
+        script: |
+          set -e
+          xcodebuild -project Polaris.xcodeproj \
+            -scheme Polaris \
+            -configuration Release \
+            -sdk iphoneos \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            MARKETING_VERSION=$APP_VERSION \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            SYMROOT=build \
+            clean build
+      - name: Verify architecture (arm64)
+        script: |
+          set -e
+          APP="build/Release-iphoneos/Polaris.app"
+          if [ ! -d "$APP" ]; then
+            # 兜底查找（构建布局变化时）
+            APP=$(find build -name "Polaris.app" -type d | head -1)
+          fi
+          echo "Using APP=$APP"
+          test -d "$APP"
+          echo "== 主二进制架构 =="
+          lipo -info "$APP/Polaris"
+          if ! lipo -info "$APP/Polaris" | grep -q "arm64"; then
+            echo "[!] arm64 not found"; exit 1
+          fi
+      - name: Package .tipa / .ipa (Polaris)
+        script: |
+          set -e
+          APP="build/Release-iphoneos/Polaris.app"
+          if [ ! -d "$APP" ]; then
+            APP=$(find build -name "Polaris.app" -type d | head -1)
+          fi
+          rm -rf Payload Polaris.tipa Polaris.ipa
+          mkdir Payload
+          cp -R "$APP" Payload/
+          zip -qry Polaris.tipa Payload
+          # 同一产物再输出一份 .ipa（文件名不同，内容一致）
+          cp Polaris.tipa Polaris.ipa
+          echo "== 包内容预览 =="
+          unzip -l Polaris.tipa | head -30
+          echo "[ok] Polaris.tipa / Polaris.ipa 打包完成"
+    artifacts:
+      - Polaris.tipa
+      - Polaris.ipa
+      - /tmp/xcodebuild_logs/*.log
