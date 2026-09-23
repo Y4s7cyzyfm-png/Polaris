@@ -5,8 +5,16 @@
 //  C interface exposed to Swift through Polaris-Bridging-Header.h.
 //  Wraps the vendored DarkSword kernel exploit (kernel read/write only).
 //
+//  NOTE: definitions live in PolarisBridge.mm (Objective-C++). The
+//  extern "C" wrapper below is mandatory — without it the symbols get
+//  C++-mangled and the linker reports "Undefined symbols" from Swift.
+//
 
 #import <Foundation/Foundation.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -29,3 +37,7 @@ NSArray<NSString *> *PolarisConsoleLogLines(void);
 void PolarisClearConsoleLog(void);
 
 NS_ASSUME_NONNULL_END
+
+#ifdef __cplusplus
+}
+#endif
