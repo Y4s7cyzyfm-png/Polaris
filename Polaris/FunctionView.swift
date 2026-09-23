@@ -144,7 +144,7 @@ struct FunctionView: View {
         state = .running
         progress = 0.03
         stage = "正在准备启动"
-        UINotificationFeedbackGenerator().notificationOccurred(.impactmedium)
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
         PolarisInitializeDarkSwordKernel()
         refresh()
     }
@@ -153,12 +153,12 @@ struct FunctionView: View {
     private func refresh() {
         let ready = PolarisKernelIsReady()
         let running = PolarisKernelIsRunning()
-        let error = PolarisBridgeLastError() ?? ""
+        let error = PolarisBridgeLastError()
 
-        stage = PolarisBridgeStage() ?? "等待开始"
+        stage = PolarisBridgeStage()
         progress = PolarisBridgeProgress()
         lastError = error
-        logLines = (PolarisConsoleLogLines() as? [String]) ?? []
+        logLines = PolarisConsoleLogLines()
 
         if ready {
             state = .success
