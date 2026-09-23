@@ -28,6 +28,7 @@
 // Vendored DarkSword headers are plain C / Objective-C.
 extern "C" {
 #import "darksword.h"
+#import "gameproc.h"
 #import "offsets.h"
 #import "utils.h"
 }
@@ -41,6 +42,12 @@ static NSString *g_stage = @"等待开始";
 static std::atomic_bool g_kernelReady(false);
 static std::atomic_bool g_kernelRunning(false);
 static std::atomic<double> g_progress(0.0);
+
+// 游戏进程（smoba）解析结果，由 PolarisAcquireGameProcess() 写入。
+static std::atomic_bool g_gameReady(false);
+static std::atomic<int> g_gamePid(0);
+static std::atomic<uint64_t> g_gameProcAddr(0);
+static NSString *g_gameStatus = @"尚未获取游戏进程";
 
 // ---------------------------------------------------------------------------
 // In-app console log ring buffer（功能页「详细日志」视图的数据源）
@@ -489,6 +496,75 @@ double PolarisBridgeProgress(void) { return g_progress.load(); }
 
 uint64_t PolarisKernelBase(void) { return ds_get_kernel_base(); }
 uint64_t PolarisKernelSlide(void) { return ds_get_kernel_slide(); }
+
+// ---------------------------------------------------------------------------
+// 游戏进程（smoba）— 对应功能页「获取游戏进程」按钮
+// ---------------------------------------------------------------------------
+
+BOOL PolarisAcquireGameProcess(void) {
+    // 内核未就绪时直接失败：不要在没有 krw 原语的情况下碰内核内存。
+    if (!PolarisKernelIsReady()) {
+        g_gameReady.store(false);
+        g_gamePid.store(0);
+        g_gameProcAddr.store(0);
+        os_unfair_lock_lock(&g_stateLock);
+        g_gameStatus = @"内核未就绪，请先启动内核利用";
+        os_unfair_lock_unlock(&g_stateLock);
+        polaris_set_stage(@"内核未就绪");
+        polaris_set_error(@"请先启动内核利用，再获取游戏进程。");
+        polaris_post_progress();
+        return NO;
+    }
+
+    polaris_set_error(@"");
+    polaris_set_stage(@"正在读取游戏进程");
+
+    // 同步执行：与 Rein 的 ReinReadGameProcess() 一致，纯内核链表遍历，耗时极短。
+    int pid = 0;
+    uint64_t procAddr = 0;
+    bool found = polaris_find_game_process(&pid, &procAddr);
+
+    char message[256] = {0};
+    polaris_describe_game_process(message, (int)sizeof(message));
+    NSString *status = message[0] ? @(message) : @"获取游戏进程失败";
+
+    os_unfair_lock_lock(&g_stateLock);
+    g_gameStatus = status;
+    os_unfair_lock_unlock(&g_stateLock);
+
+    if (!found) {
+        g_gameReady.store(false);
+        g_gamePid.store(0);
+        g_gameProcAddr.store(0);
+        PB_LOG_ERROR("game process lookup failed: %{public}@", status);
+        polaris_set_stage(status);
+        polaris_set_error(status);
+        polaris_post_progress();
+        return NO;
+    }
+
+    g_gameReady.store(true);
+    g_gamePid.store(pid);
+    g_gameProcAddr.store(procAddr);
+    PB_LOG("game process ready — %{public}s pid=%d proc=0x%llx",
+           POLARIS_GAME_PROCESS_NAME, pid, (unsigned long long)procAddr);
+    polaris_set_stage(status);
+    polaris_post_progress();
+    return YES;
+}
+
+BOOL PolarisGameProcessIsReady(void) { return g_gameReady.load(); }
+
+int PolarisGameProcessPID(void) { return g_gamePid.load(); }
+
+uint64_t PolarisGameProcessProcAddress(void) { return g_gameProcAddr.load(); }
+
+NSString *PolarisGameProcessStatus(void) {
+    os_unfair_lock_lock(&g_stateLock);
+    NSString *status = [g_gameStatus copy] ?: @"";
+    os_unfair_lock_unlock(&g_stateLock);
+    return status;
+}
 
 void PolarisInitializeDarkSwordKernel(void) {
     if (PolarisKernelIsReady()) {

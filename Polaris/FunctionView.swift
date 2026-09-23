@@ -32,6 +32,12 @@ struct FunctionView: View {
     @State private var kernelSlide: UInt64 = 0
     @State private var logLines: [String] = []
 
+    // MARK: - 游戏进程（smoba）
+
+    @State private var gameReady = false
+    @State private var gamePid: Int32 = 0
+    @State private var gameStatus: String = "尚未获取游戏进程"
+
     // MARK: - 利用选项
 
     @State private var verboseLog = false
@@ -55,6 +61,10 @@ struct FunctionView: View {
                                kernelBase: kernelBase,
                                kernelSlide: kernelSlide)
                 ActionButtonView(state: state, action: handleActionButton)
+                GameProcessButtonView(exploitState: state,
+                                      gameReady: gameReady,
+                                      gamePid: gamePid,
+                                      action: handleGameProcessButton)
                 optionsCard
                 if verboseLog {
                     LogConsoleCard(lines: logLines, onClear: clearLog)
@@ -149,6 +159,19 @@ struct FunctionView: View {
         refresh()
     }
 
+    /// 调用 PolarisBridge 读取游戏进程（smoba）
+    /// 只有内核就绪后才能读取：链路与 Rein 一致
+    /// （proc_find_by_name → ds_kread32(proc + off_proc_p_pid)）。
+    private func handleGameProcessButton() {
+        guard state == .success else {
+            UINotificationFeedbackGenerator().notificationOccurred(.warning)
+            return
+        }
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        _ = PolarisAcquireGameProcess()
+        refresh()
+    }
+
     /// 从 Bridge 拉取最新状态并刷新 UI
     private func refresh() {
         let ready = PolarisKernelIsReady()
@@ -159,6 +182,10 @@ struct FunctionView: View {
         progress = PolarisBridgeProgress()
         lastError = error
         logLines = PolarisConsoleLogLines()
+
+        gameReady = PolarisGameProcessIsReady()
+        gamePid = PolarisGameProcessPID()
+        gameStatus = PolarisGameProcessStatus()
 
         if ready {
             state = .success
@@ -225,7 +252,7 @@ private struct StatusCardView: View {
                     .font(.system(size: 14, weight: .semibold))
                     .foregroundStyle(statusColor)
                 Spacer()
-                Text("v0.2.0")
+                Text("v0.3.0")
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 8)
@@ -383,6 +410,100 @@ private struct ActionButtonView: View {
         case .failed:  return .red
         default:       return Theme.accent
         }
+    }
+}
+
+// MARK: - 获取游戏进程按钮（位于「启动内核利用」正下方）
+
+private struct GameProcessButtonView: View {
+    let exploitState: FunctionView.ExploitState
+    let gameReady: Bool
+    let gamePid: Int32
+    let action: () -> Void
+
+    /// 只有内核就绪才能点击
+    private var enabled: Bool {
+        exploitState == .success
+    }
+
+    private var title: String {
+        if gameReady {
+            return "游戏进程 · pid \(gamePid)"
+        }
+        if exploitState == .success {
+            return "获取游戏进程"
+        }
+        if exploitState == .running {
+            return "等待内核就绪…"
+        }
+        return "获取游戏进程"
+    }
+
+    private var subtitle: String {
+        if gameReady { return "smoba · 已附加" }
+        if exploitState == .success { return "smoba · 主二进制" }
+        return "需先启动内核利用"
+    }
+
+    private var icon: String {
+        if gameReady { return "checkmark.circle.fill" }
+        return "magnifyingglass.circle.fill"
+    }
+
+    private var iconColor: Color {
+        if gameReady { return Theme.success }
+        return enabled ? Theme.accent : Color(white: 0.5)
+    }
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 12) {
+                Image(systemName: icon)
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(iconColor)
+                    .frame(width: 38, height: 38)
+                    .background(
+                        RoundedRectangle(cornerRadius: 11, style: .continuous)
+                            .fill(iconColor.opacity(0.16))
+                    )
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(enabled ? .white : Color(white: 0.62))
+                    Text(subtitle)
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 13)
+            .frame(maxWidth: .infinity)
+            .background(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .fill(Theme.card)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .strokeBorder(
+                        gameReady
+                            ? AnyShapeStyle(Theme.success.opacity(0.45))
+                            : AnyShapeStyle(Color.white.opacity(0.07)),
+                        lineWidth: 1
+                    )
+            )
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
+        .opacity(enabled ? 1.0 : 0.6)
+        .animation(.easeInOut(duration: 0.25), value: gameReady)
+        .animation(.easeInOut(duration: 0.25), value: exploitState)
     }
 }
 

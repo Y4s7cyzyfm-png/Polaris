@@ -8,7 +8,7 @@ workflows:
       xcode: latest
       vars:
         BUNDLE_ID: com.polaris.toolkit
-        APP_VERSION: 0.2.0
+        APP_VERSION: 0.3.0
     triggering:
       events:
         - push
