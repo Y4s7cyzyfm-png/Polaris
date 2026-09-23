@@ -1,19 +1,14 @@
-# Codemagic CI/CD 配置 —— Polaris
-# 流水线结构借鉴自 Rein 项目：https://github.com/Y4s7cyzyfm-png/Rein
-#   无签名编译 → 架构校验 → 打包 .tipa / .ipa（适配 TrollStore / 侧载分发）
-# Codemagic YAML 文档: https://docs.codemagic.io/yaml/yaml-getting-started/
-
 workflows:
   polaris-tipa:
-    name: Polaris TIPA (arm64)
+    name: Polaris TIPA (arm64e)
     max_build_duration: 60
     instance_type: mac_mini_m2
     environment:
-      # 使用最新 Xcode（iOS SDK）
+      # Xcode 26.x for iOS 26 SDK / arm64e
       xcode: latest
       vars:
         BUNDLE_ID: com.polaris.toolkit
-        APP_VERSION: 0.1.0
+        APP_VERSION: 0.2.0
     triggering:
       events:
         - push
@@ -22,16 +17,18 @@ workflows:
           include: true
           source: false
     scripts:
-      - name: Build Polaris (arm64, unsigned)
+      - name: Build Polaris (arm64e only, unsigned)
         script: |
           set -e
+          # Force arm64e single-arch (ARCHS=arm64e already set in the target config)
           xcodebuild -project Polaris.xcodeproj \
             -scheme Polaris \
             -configuration Release \
             -sdk iphoneos \
-            ARCHS=arm64 \
-            ONLY_ACTIVE_ARCH=NO \
-            MARKETING_VERSION=$APP_VERSION \
+            ARCHS=arm64e \
+            ONLY_ACTIVE_ARCH=YES \
+            VALID_ARCHS=arm64e \
+            MARKETING_VERSION=0.2.0 \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
@@ -39,21 +36,62 @@ workflows:
             AD_HOC_CODE_SIGNING_ALLOWED=YES \
             SYMROOT=build \
             clean build
-      - name: Verify architecture (arm64)
+      - name: Verify architecture (arm64e only)
         script: |
           set -e
           APP="build/Release-iphoneos/Polaris.app"
           if [ ! -d "$APP" ]; then
-            # 兜底查找（构建布局变化时）
+            # fallback for derivedData-style or other layout
             APP=$(find build -name "Polaris.app" -type d | head -1)
           fi
           echo "Using APP=$APP"
-          test -d "$APP"
-          echo "== 主二进制架构 =="
-          lipo -info "$APP/Polaris"
-          if ! lipo -info "$APP/Polaris" | grep -q "arm64"; then
-            echo "[!] arm64 not found"; exit 1
+          BIN="$APP/Polaris"
+          echo "== main binary =="
+          lipo -info "$BIN"
+          if ! lipo -info "$BIN" | grep -q "arm64e"; then
+            echo "[!] arm64e not found"; exit 1
           fi
+          if lipo -info "$BIN" | grep -q ","; then
+            echo "[!] unexpected multi-arch binary"; exit 1
+          fi
+      - name: Stage resources & fake-sign
+        script: |
+          set -e
+          brew install ldid || true
+          APP="build/Release-iphoneos/Polaris.app"
+          if [ ! -d "$APP" ]; then
+            APP=$(find build -name "Polaris.app" -type d | head -1)
+          fi
+          ENT="supports/entitlements-polaris.plist"
+          echo "APP=$APP ENT=$ENT"
+
+          # 主二进制伪签
+          ldid -S"$ENT" "$APP/Polaris"
+
+          # 嵌入的 dylib（libxpf / libgrabkernel2）也必须伪签：
+          # CODE_SIGNING_ALLOWED=NO 时 dylib 无签名，dyld 直接拒绝加载 → 启动闪退。
+          mkdir -p "$APP/Frameworks"
+          # 同步组可能把 dylib 拷到 app 根目录，统一收进 Frameworks
+          find "$APP" -name '*.dylib' -not -path "$APP/Frameworks/*" | while read -r dylib; do
+            mv -f "$dylib" "$APP/Frameworks/$(basename "$dylib")"
+          done
+          # 若同步组未拷贝，则从 Vendor/darksword-lib-thin 手动补入
+          if [ ! -f "$APP/Frameworks/libxpf.dylib" ]; then
+            cp -f Polaris/Kernel/Vendor/lib/libxpf.dylib "$APP/Frameworks/"
+          fi
+          if [ ! -f "$APP/Frameworks/libgrabkernel2.dylib" ]; then
+            cp -f Polaris/Kernel/Vendor/lib/libgrabkernel2.dylib "$APP/Frameworks/"
+          fi
+          for dylib in "$APP"/Frameworks/*.dylib; do
+            [ -e "$dylib" ] || continue
+            ldid -S"$ENT" "$dylib"
+          done
+          echo "== 签名后的 Frameworks =="
+          ls -l "$APP/Frameworks" || true
+          # 硬校验：两个 dylib 必须存在
+          test -f "$APP/Frameworks/libxpf.dylib"
+          test -f "$APP/Frameworks/libgrabkernel2.dylib"
+          echo "[ok] libxpf / libgrabkernel2 staged & signed"
       - name: Package .tipa / .ipa (Polaris)
         script: |
           set -e
@@ -65,12 +103,14 @@ workflows:
           mkdir Payload
           cp -R "$APP" Payload/
           zip -qry Polaris.tipa Payload
-          # 同一产物再输出一份 .ipa（文件名不同，内容一致）
+          # 同一产物再输出一份 .ipa（名字 Polaris.ipa）
           cp Polaris.tipa Polaris.ipa
-          echo "== 包内容预览 =="
-          unzip -l Polaris.tipa | head -30
-          echo "[ok] Polaris.tipa / Polaris.ipa 打包完成"
+          echo "== tipa 内容 =="
+          unzip -l Polaris.tipa | head -40
+          # 产物校验：dylib 必须进包
+          unzip -l Polaris.tipa | grep -q "Frameworks/libxpf.dylib"
+          unzip -l Polaris.tipa | grep -q "Frameworks/libgrabkernel2.dylib"
+          echo "[ok] Polaris.tipa / Polaris.ipa contain dylibs"
     artifacts:
       - Polaris.tipa
       - Polaris.ipa
-      - /tmp/xcodebuild_logs/*.log
