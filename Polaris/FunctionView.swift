@@ -81,7 +81,7 @@ struct FunctionView: View {
             Text("Polaris")
                 .font(.system(size: 34, weight: .bold, design: .rounded))
                 .foregroundStyle(Theme.gradient)
-            Text("内核工具箱 · DarkSword")
+            Text("Smoba · DarkSword")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
         }
@@ -122,8 +122,8 @@ struct FunctionView: View {
     private var featuresCard: some View {
         Card(title: "功能开关") {
             FeatureRow(icon: "externaldrive.fill",
-                       title: "文件系统读写",
-                       subtitle: "以读写权限重新挂载系统分区（即将推出）",
+                       title: "开启内透",
+                       subtitle: "小地图显示全图视野",
                        isOn: $filesystemRW)
         }
     }
