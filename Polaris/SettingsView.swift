@@ -5,7 +5,7 @@ import SwiftUI
 struct SettingsView: View {
 
     /// TODO: 替换为你的官方 Telegram 频道链接
-    private let telegramURL = URL(string: "https://t.me/polaris_channel")!
+    private let telegramURL = URL(string: "https://t.me/xiaoniannya520")!
 
     @Environment(\.openURL) private var openURL
 
@@ -75,7 +75,7 @@ struct SettingsView: View {
 
     private var aboutCard: some View {
         Card(title: "关于") {
-            aboutRow(title: "版本", value: "0.1.0（UI 预览版）")
+            aboutRow(title: "版本", value: "0.2.0")
             CardDivider()
             aboutRow(title: "项目代号", value: "Polaris · 北极星")
             CardDivider()
