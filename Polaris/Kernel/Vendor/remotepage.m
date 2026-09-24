@@ -188,7 +188,12 @@ static char gEntryTrace[512] = {0};
 /// 第 1/2/3 档的 offset 究竟是 0 还是 `0x9e3c000` —— 排查完全靠猜。
 ///
 /// 这里累积每一档的 `off/size/prot -> ret` 摘要，失败时一次性打出。
-static char gTierTrace[512] = {0};
+///
+/// ★ v0.4.9 扩容 512→1024：v0.4.8 实测单档摘要最长约 83 字节，而
+///   阶梯最多可展到 8 档（2 个 offset 候选 × 3 个 prot，再加 2 个整块档）。
+///   8 × 83 = 664 > 512，会被截断 —— 而「截断」正是本项目反复踩的坑，
+///   这次提前留够余量。
+static char gTierTrace[1024] = {0};
 
 static void pr_set_message(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void pr_set_message(const char *fmt, ...) {
@@ -600,6 +605,69 @@ static polaris_vmshmem_t pr_create_shmem_with_obj(struct pr_vmobj *object) {
                  " neSz=0x%llx", (unsigned long long)namedEntrySize);
     }
 
+    // ★★★ v0.4.9 核心修复：把 named_entry->size 抬到足够大。
+    //
+    //   真机 v0.4.8 逐档日志给出了决定性证据：
+    //       #1 off=0x9e3c000 sz=0x4000 prot=0x47 -> (4) invalid argument
+    //       #2 off=0x9e3c000 sz=0x4000 prot=0x7  -> (0x11) invalid right
+    //       #3 off=0x9e3c000 sz=0x4000 prot=0x3  -> (4) invalid argument
+    //       #4 off=0x0       sz=0x8000000 prot=0x7 -> (0x11) invalid right
+    //
+    //   据此可把两道门**完全反推**出来（模型与真机 4/4 吻合）：
+    //
+    //   第一道「权限门」(mementry.c:4176-4189)：named_entry->protection = 0x3
+    //     prot=0x7 被拒 -> protection 缺 EXECUTE
+    //     prot=0x3 通过 -> protection 含 READ|WRITE
+    //     prot=0x47 通过 -> mask 置位，请求权限被清零后取交集恒成立
+    //
+    //   第二道「尺寸门」(mementry.c:4198-4201)：
+    //     if (named_entry->size < obj_offs + initial_size) return (4)
+    //     named_entry->size = 0x8000000 (128MB = ANON_CHUNK_SIZE)
+    //     obj_offs + size   = 0x9e3c000 + 0x4000 = 0x9e40000
+    //     0x8000000 < 0x9e40000  ->  触发 -> (4)
+    //
+    //   ★ 为什么 #2 报 0x11 而 #1/#3 报 0x4：
+    //     权限门在尺寸门**之前**。#2 的 prot=0x7 先被权限门拒掉，
+    //     根本没机会走到尺寸门。#1/#3 通过了权限门，倒在尺寸门。
+    //
+    //   ★ 为什么 #4 报 0x11：它的 size 恰好等于 namedEntrySize，
+    //     尺寸门**通过**了；但 prot=0x7 在权限门就被拒。
+    //
+    //   结论：**真正的拦路虎是尺寸门**。权限修好也没用。
+    //   而 size 校验只是一个**纯数值比较**，没有任何硬件/MMU 约束——
+    //   所以直接把 named_entry->size 抬到够用即可。
+    //
+    //   需要满足：named_entry->size >= off + size（对我们要用的每档）
+    //   最小值就是 entryOffset + 一页，向上取整到页。
+    //
+    //   注意：named_entry 是本进程私有的对象，随 mach_vm_deallocate
+    //   释放，且我们只映射一页，影响面可控。
+    if (okNEs && namedEntrySize != 0) {
+        // 目标下界：entryOffset + 一页（这是精度最高那一档所需的最小值）
+        uint64_t needSize = pr_round_page(object->entryOffset + PR_MAP_PAGE_SIZE);
+        if (needSize == 0) needSize = PR_MAP_PAGE_SIZE;
+
+        if (namedEntrySize < needSize) {
+            @try {
+                ds_kwrite64(shmemnamedentry + off_vm_named_entry_size, needSize);
+                snprintf(gEntryTrace + strlen(gEntryTrace),
+                         sizeof(gEntryTrace) - strlen(gEntryTrace),
+                         " neSz→0x%llx(抬高)", (unsigned long long)needSize);
+                namedEntrySize = needSize;
+            } @catch (NSException *e) {
+                snprintf(gEntryTrace + strlen(gEntryTrace),
+                         sizeof(gEntryTrace) - strlen(gEntryTrace),
+                         " [neSz 抬高失败:需0x%llx]",
+                         (unsigned long long)needSize);
+            } @catch (...) {
+                snprintf(gEntryTrace + strlen(gEntryTrace),
+                         sizeof(gEntryTrace) - strlen(gEntryTrace),
+                         " [neSz 抬高失败:需0x%llx]",
+                         (unsigned long long)needSize);
+            }
+        }
+    }
+
     bool okBC = false, okSZ = false;
     uint64_t shmemvmcopyaddr = pr_safe_kread64(shmemnamedentry + off_vm_named_entry_backing_copy, &okBC);
     uint64_t nextaddr        = pr_safe_kread64(shmemvmcopyaddr + off_vm_named_entry_size, &okSZ);
@@ -901,11 +969,19 @@ static polaris_vmshmem_t pr_create_shmem_with_obj(struct pr_vmobj *object) {
     // 它能让映射成功（把 offset 彻底归零，绕开所有 offset 相关校验），
     // 但映射到的是对象起始处，不是目标页。
     // 只有「读 Mach-O 头」这类自带 magic 校验的调用方才敢用。
+    //
+    // ★ v0.4.9：真机已证明这一档在 prot=0x7 时**必被权限门拒**（0x11）。
+    //   现在给它同时试 0x3（已知 entry 权限）与 0x47（mask 收敛）。
+    //   幂等性：命中即 break，成功时不会重复映射。
     if (okNEs && namedEntrySize != 0) {
         uint64_t whole = namedEntrySize;
         if ((whole & (PR_MAP_PAGE_SIZE - 1)) == 0 && whole >= mapPageSize) {
-            tries[ntries++] = (pr_maptry_t){ 0, whole, VM_PROT_ALL,
-                                             false, "off=0 size=namedEntrySize(不精确)" };
+            tries[ntries++] = (pr_maptry_t){ 0, whole,
+                                             (vm_prot_t)(VM_PROT_READ | VM_PROT_WRITE),
+                                             false, "off=0 整块(RW)" };
+            tries[ntries++] = (pr_maptry_t){ 0, whole,
+                                             (vm_prot_t)(VM_PROT_ALL | PR_VM_PROT_IS_MASK),
+                                             false, "off=0 整块(ALL|IS_MASK)" };
         }
     }
 

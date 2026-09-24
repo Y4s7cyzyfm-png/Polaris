@@ -594,10 +594,87 @@ if (mask_cur) cur &= named_entry->protection;   /* ← 取交集 */
 一个取值**能同时让 `0x47`/`0x7`/`0x3` 三档都返回 `0x11`。即便
 `protection = 0`，`0x47` 档仍返回成功。
 
-结论：v0.4.7 日志说的"全部 4 档均失败"与源码模型不符。只有两种可能——
-日志措辞把"末档"当成了"全部"，或失败发生在更上游（如 entry 本身读脏）。
-**这只能靠逐档留痕区分**，正是 `gTierTrace` 要解决的。因此
-**v0.4.8 的真机逐档明细是唯一继续前进的路径**，在此之前不再叠加新的内核侧假设。
+结论：v0.4.7 日志说的"全部 4 档均失败"与源码模型不符 —— 但当时无法区分
+是措辞问题还是上游问题，**只能靠逐档留痕区分**。v0.4.8 加上了 `gTierTrace`。
+
+#### ★ 谜题解开：v0.4.8 真机逐档数据（两道门全部定位）
+
+v0.4.8 真机拿到了完整的逐档返回码：
+
+```
+逐档: #1 off=0x9e3c000 sz=0x4000    prot=0x47 -> (os/kern) invalid argument(0x4)
+      #2 off=0x9e3c000 sz=0x4000    prot=0x7  -> (os/kern) invalid right(0x11)
+      #3 off=0x9e3c000 sz=0x4000    prot=0x3  -> (os/kern) invalid argument(0x4)
+      #4 off=0x0       sz=0x8000000 prot=0x7  -> (os/kern) invalid right(0x11)
+```
+
+这一行信息把两道门**完全反推**了出来，且模型与真机 **4/4 吻合**：
+
+**第一道「权限门」→ 反推出 `named_entry->protection = 0x3`**
+
+| 请求 prot | 结果 | 推论 |
+|---|---|---|
+| `0x7` (RWX) | `0x11` 被拒 | `protection` **缺 `EXECUTE`** |
+| `0x3` (RW) | 通过（倒在尺寸门） | `protection` **含 `READ\|WRITE`** |
+| `0x47` | 通过（倒在尺寸门） | mask 置位后请求权限被清零，子集校验恒成立 ✔ |
+
+即 `mach_make_memory_entry_64(..., VM_PROT_ALL)` 实际只拿到 `READ|WRITE`。
+
+> 注意这**推翻了我此前"`0x47` 必成功"的模型**：它确实通过了权限门，
+> 但没能成功 —— 因为它倒在了第二道门上。逐档日志的价值正在于此。
+
+**第二道「尺寸门」→ 这才是真正的拦路虎**
+
+```c
+/* mementry.c:4198-4201 */
+if (named_entry->size < obj_offs + initial_size) return KERN_INVALID_ARGUMENT;
+```
+
+| 量 | 值 |
+|---|---|
+| `named_entry->size` | `0x8000000`（128MB = `ANON_CHUNK_SIZE`） |
+| `obj_offs + initial_size` | `0x9e3c000 + 0x4000` = `0x9e40000`（158MB） |
+| 判定 | `0x8000000 < 0x9e40000` → **触发** → `(4)` |
+
+**为什么 `#2` 报 `0x11` 而 `#1`/`#3` 报 `0x4`：** 权限门在尺寸门**之前**。
+`#2` 的 `prot=0x7` 先被权限门拒掉，根本没机会走到尺寸门；`#1`/`#3`
+通过了权限门，倒在尺寸门。
+
+**为什么 `#4` 报 `0x11`：** 它的 `size` 恰好等于 `namedEntrySize`，
+尺寸门**通过**了，但 `prot=0x7` 在权限门就被拒。（末档此前一直用
+`VM_PROT_ALL` 作 prot，正好踩在已知必败的组合上。）
+
+#### v0.4.9：抬高 `named_entry->size`
+
+既然真正的拦路虎是尺寸门，而它只是一个**纯数值比较**（无任何硬件/MMU
+约束），最直接的修法就是把 `named_entry->size` 抬到够用：
+
+```c
+needSize = pr_round_page(object->entryOffset + PR_MAP_PAGE_SIZE);
+if (namedEntrySize < needSize)
+    ds_kwrite64(shmemnamedentry + off_vm_named_entry_size, needSize);
+```
+
+`named_entry` 是本进程私有对象、随 `mach_vm_deallocate` 释放，且每次
+映射前都重建，影响面可控。
+
+同时修正末档的 prot：此前用 `VM_PROT_ALL`（`0x7`）恰好必败，现在
+改为同时试 `0x3`（已知 entry 权限）与 `0x47`（mask 收敛）。
+另把 `gTierTrace` 从 512 扩到 1024 —— 阶梯最多可展到 8 档
+（2 offset × 3 prot + 2 整块），按单档最长 83 字节算 `8 × 83 = 664 > 512`，
+**又会踩截断的坑**，这次提前留够。
+
+修复后的阶梯推演（`entryOffset = 0x9e3c000`，`size` 已抬到 `0x9e40000`）：
+
+| # | off | size | prot | 预测 |
+|---|---|---|---|---|
+| **1** | `0x9e3c000` | `0x4000` | `0x47` | **成功**（精确指目标页）🎉 |
+| 2 | `0x9e3c000` | `0x4000` | `0x7` | `0x11`（权限门，预期） |
+| 3 | `0x9e3c000` | `0x4000` | `0x3` | 成功（精确） |
+| 4 | `0` | `0x9e40000` | `0x3` | 成功（不精确） |
+| 5 | `0` | `0x9e40000` | `0x47` | 成功（不精确） |
+
+**第 1 档就会命中且是精确偏移** —— 内透读写将落到正确页面上。
 
 
 ### 读取路径的分层
@@ -711,7 +788,8 @@ Polaris/
 
 | 版本 | 变更 |
 |---|---|
-| 0.4.8 | **修「诊断信息被截断」+ 找到 `named_entry->offset` 这个真 bug**。第三轮真机（v0.4.7）档数已从 1 涨到 4（二维展开生效），但仍报 `invalid right(0x11)`；且日志止于 `· obj=0xffffffe66cffed00 ob` ——**被静默截断**。逐层查出是缓冲区太小：`remotepage.m` 的 `gMessage`(256) / `gFirstFailDetail`(192)、`unitypatch.m` 的 `gMessage`(256) / `why`(192) / `detail`(192)、以及**真正的截断点** `PolarisBridge.mm` 的 `char message[256]`（×3）——`remotepage` 拼好的长信息在 C→OC 边界又被砍回 256 字节。全部统一扩到 1024。同时：**① 新增 `gTierTrace` 逐档留痕**，每档记 `#n off/sz/prot -> err`，失败时整条打出（此前只看得到末档，第 1 档 `prot=ALL\|IS_MASK` 报什么错完全不可见）；**② `gEntryTrace` 补上原始输入** `eStart`/`vmeOffraw`；**③ `vme_offset` 非 0 时主动告警**。数值核对：`target-base = 0x9e3f824` ✅；`obj=0xffffffe66cffed00` ✅ 落在 `[VM_MIN,VM_MAX]` 内且 64 字节对齐（**排除「压缩指针解包错误」**）。<br>**④ 本版核心新发现（对照 XNU 源码确证）：`named_entry->offset` 才是真正生效的对象内偏移。** `mementry.c:4212` 在 `named_entry->offset` 非 0 时执行 `vm_map_enter_adjust_offset(&obj_offs, ..., named_entry->offset)`，而该函数（`mementry.c:3966`）做的是 **加法** `*obj_offs += quantity` —— 故 `effective_offset = mach_vm_map 的 off + named_entry->offset`。此值在建 entry 时由 `mementry2.c:890` 从本地 entry 的 `vme_offset` **快照冻结**，而我们写的 `entry.vme_offset = object->objectOffset` 是**单位错误**（字节 ≠ 4KB 页号）。这解释了「offset 维度为何形同无效」：所有候选被同一个加法项整体平移，v0.4.6 的 `0x9e3c000` 与 v0.4.7 的 `0` 表现一致。修法：`ds_kwrite64` 把 `named_entry->offset` **显式归零**，偏移改由 `mach_vm_map` 的 `off` 全权决定。`struct vm_named_entry` 布局由 XNU 源码定，并用两个已知值交叉校验（`backing=+0x10` ✅、`size=+0x20` ✅ ⇒ `offset=+0x18`）。<br>**⑤ 澄清 `0x8000000`(128MB) 不是异常**：等于 `osfmk/mach/arm/vm_param.h` 的 `ANON_CHUNK_SIZE`，内核按 128MB 分块匿名对象，`named_entry` 只覆盖首块，故它与 `vm_object` 大小**本就不相等**。<br>**⑥ 证伪一个假设**：曾疑 `pr_vmmapentry` 联合首成员 4 vs 8 字节导致 `vme_offset` 错位，用 `-fdump-record-layouts` 交叉编译实测两者布局**完全相同**（`vme_alias:12`+`vme_offset:52` 共 64 位，必然独占一个 64 位单元），无需改动。<br>**⑦ 记下一个待真机复核的悖论**：按 `mementry.c:4163-4189` 穷举 `named_entry->protection` 的 0x00–0x7f，**不存在任何取值**能让 `0x47` 档返回 `0x11`（mask 置位后请求权限先取交集，子集校验必然成立）。故 v0.4.7 的「全部 4 档均失败」与源码模型不符，**必须靠逐档明细判定**，在此之前不再叠加新假设 |
+| 0.4.9 | **★ 谜题解开并修复：抬高 `named_entry->size`，跨过真正的拦路虎。** v0.4.8 的逐档留痕拿到了决定性数据：`#1 off=0x9e3c000 prot=0x47 -> (4)`、`#2 prot=0x7 -> (0x11)`、`#3 prot=0x3 -> (4)`、`#4 off=0 sz=0x8000000 prot=0x7 -> (0x11)`。<br>**① 反推出 `named_entry->protection = 0x3`**：`0x7` 被拒 ⇒ 缺 `EXECUTE`；`0x3` 通过 ⇒ 含 `READ\|WRITE`。（这**推翻了我此前「`0x47` 必成功」的模型** —— 它确实过了权限门，但倒在了第二道门。）<br>**② 定位真正的拦路虎 = 尺寸门**（`mementry.c:4198`）：`named_entry->size`(`0x8000000`=128MB) < `obj_offs+size`(`0x9e3c000+0x4000`=`0x9e40000`=158MB) ⇒ `(4)`。这也解释了 `#2` 为何报 `0x11` 而非 `0x4` —— **权限门在尺寸门之前**，`0x7` 先被权限门拒掉，根本没走到尺寸门。模型与真机 **4/4 吻合**。<br>**③ 修法**：尺寸门只是**纯数值比较**（无任何硬件/MMU 约束），故直接 `ds_kwrite64(namedEntry+0x20, pr_round_page(entryOffset+PAGE))` 把它抬高到够用；`named_entry` 是本进程私有对象、随 `mach_vm_deallocate` 释放，影响面可控。<br>**④ 加固末档 prot**：此前用 `VM_PROT_ALL`(`0x7`) 恰好是已知必败组合，改为同时试 `0x3` 与 `0x47`。<br>**⑤ 预防性扩容**：`gTierTrace` 512→1024 —— 阶梯最多可展到 8 档（2 offset × 3 prot + 2 整块），单档最长 83 字节，`8×83=664 > 512` **又会踩截断的坑**。<br>**预测**：修复后 `#1 off=0x9e3c000 sz=0x4000 prot=0x47` 将**直接成功且偏移精确**，内透读写落到正确页面 |
+| 0.4.8 | **修「诊断信息被截断」+ 找到 `named_entry->offset` 这个真 bug**。第三轮真机（v0.4.7）档数已从 1 涨到 4（二维展开生效），但仍报 `invalid right(0x11)`；且日志止于 `· obj=0xffffffe66cffed00 ob` ——**被静默截断**。逐层查出是缓冲区太小：`remotepage.m` 的 `gMessage`(256) / `gFirstFailDetail`(192)、`unitypatch.m` 的 `gMessage`(256) / `why`(192) / `detail`(192)、以及**真正的截断点** `PolarisBridge.mm` 的 `char message[256]`（×3）——`remotepage` 拼好的长信息在 C→OC 边界又被砍回 256 字节。全部统一扩到 1024。同时：**① 新增 `gTierTrace` 逐档留痕**，每档记 `#n off/sz/prot -> err`，失败时整条打出（此前只看得到末档，第 1 档 `prot=ALL\|IS_MASK` 报什么错完全不可见）；**② `gEntryTrace` 补上原始输入** `eStart`/`vmeOffraw`；**③ `vme_offset` 非 0 时主动告警**。数值核对：`target-base = 0x9e3f824` ✅；`obj=0xffffffe66cffed00` ✅ 落在 `[VM_MIN,VM_MAX]` 内且 64 字节对齐（**排除「压缩指针解包错误」**）。<br>**④ 本版核心新发现（对照 XNU 源码确证）：`named_entry->offset` 才是真正生效的对象内偏移。** `mementry.c:4212` 在 `named_entry->offset` 非 0 时执行 `vm_map_enter_adjust_offset(&obj_offs, ..., named_entry->offset)`，而该函数（`mementry.c:3966`）做的是 **加法** `*obj_offs += quantity` —— 故 `effective_offset = mach_vm_map 的 off + named_entry->offset`。此值在建 entry 时由 `mementry2.c:890` 从本地 entry 的 `vme_offset` **快照冻结**，而我们写的 `entry.vme_offset = object->objectOffset` 是**单位错误**（字节 ≠ 4KB 页号）。这解释了「offset 维度为何形同无效」：所有候选被同一个加法项整体平移，v0.4.6 的 `0x9e3c000` 与 v0.4.7 的 `0` 表现一致。修法：`ds_kwrite64` 把 `named_entry->offset` **显式归零**，偏移改由 `mach_vm_map` 的 `off` 全权决定。`struct vm_named_entry` 布局由 XNU 源码定，并用两个已知值交叉校验（`backing=+0x10` ✅、`size=+0x20` ✅ ⇒ `offset=+0x18`）。<br>**⑤ 澄清 `0x8000000`(128MB) 不是异常**：等于 `osfmk/mach/arm/vm_param.h` 的 `ANON_CHUNK_SIZE`，内核按 128MB 分块匿名对象，`named_entry` 只覆盖首块，故它与 `vm_object` 大小**本就不相等**。<br>**⑥ 证伪一个假设**：曾疑 `pr_vmmapentry` 联合首成员 4 vs 8 字节导致 `vme_offset` 错位，用 `-fdump-record-layouts` 交叉编译实测两者布局**完全相同**（`vme_alias:12`+`vme_offset:52` 共 64 位，必然独占一个 64 位单元），无需改动。<br>**⑦ 记下一个待真机复核的悖论**：按 `mementry.c:4163-4189` 穷举 `named_entry->protection` 的 0x00–0x7f，**不存在任何取值**能让 `0x47` 档返回 `0x11`（mask 置位后请求权限先取交集，子集校验必然成立）。故 v0.4.7 的「全部 4 档均失败」与源码模型不符，**必须靠逐档明细判定**，在此之前不再叠加新假设。**→ v0.4.9 用逐档数据解开了此悖论** |
 | 0.4.7 | **修复 `(os/kern) invalid right(0x11)`，并修正 v0.4.6 阶梯的两处缺陷**。真机 v0.4.6 日志把错误码从 `KERN_INVALID_ARGUMENT(4)` 推进到 `KERN_INVALID_RIGHT(17)`——**offset/size 那层已经通过**，说明 v0.4.6 的阶梯方向对了。剩下的拒绝点是 `vm_map.c:4184/4189` 的权限子集校验：entry 是 `R\|W`(`0x3`)，map 请求 `VM_PROT_ALL`(`0x7`)，`(0x3 & 0x7) != 0x7` → 拒。**① 恢复 `VM_PROT_IS_MASK`(`0x40`) 作为首选 prot 候选**：v0.4.5 以「语义用错」为由移除它是**错的**，它其实是 XNU 的权限收敛机制（置位后内核先做 `cur_protection &= named_entry->protection`，把 `0x7` 收缩成 `0x3`），不影响「映射后能否读写」，只影响「请求权限怎么收敛」。**② `mach_make_memory_entry_64` 的 protection 提到 `VM_PROT_ALL`**（失败退回 `READ\|WRITE`），让「请求权限 ⊆ entry 权限」恒成立。**③ 阶梯从一维改为二维笛卡尔积** {`entryOffset`, `entryOffset-objectOffset`} × {`ALL\|IS_MASK`, `ALL`, `RW`}：v0.4.6 所有 offset 候选的生成条件都写死 `mapOffset != 0`，而真机这次 `entryOffset == 0`，于是只剩 1 档，正好对应日志里的「全部 1 档均失败」。**④** 失败信息末尾无条件追加 `gEntryTrace`（`obj/objsz/entryOff/objOff`），避免这四个关键数被后续 `pr_set_message` 覆盖。**`VM_PROT_IS_MASK` 假设经第三轮真机未能证实（4 档全败）** |
 | 0.4.6 | **用「阶梯重试」取代对 `mach_vm_map` 单次调用**：v0.4.5 加的 `named_entry->size` 校验经真机数据回算后**未被触发**（`0x16584000` = 357MB ≥ 需要的 `0x9e40000` = 158MB），说明拒绝点不在尺寸上。把 `KERN_INVALID_ARGUMENT(4)` 逐条对回 `vm_map.c` 的所有分支后，剩下的候选（`named_entry->offset` 非 0 导致 `obj_offs` 二次累加；或 `named_entry->size` 真实值更小）静态无法区分，于是改为按优先级逐个尝试 offset/size/prot 组合，失败档位零副作用。新增 `polaris_vmshmem_t.exact` 安全闸门：**读路径**允许不精确映射（Mach-O magic 自校验兜底），**写路径强制要求精确**，避免退化的 `offset=0` 映射把 4 字节写到游戏对象的错误页上。**遗留缺陷（v0.4.7 修）：阶梯写成一维且条件写死 `mapOffset != 0`，`entryOffset == 0` 时只剩 1 档** |
 | 0.4.5 | **定位「(os/kern) invalid argument」的怀疑点**：v0.4.4 已证明 offset(`0x9e3c000`) 与 size(`0x4000`) 都 16KB 对齐、且远在 vm_object 之内，故「不对齐/越界」两个假设被数据否掉。错误码是 `KERN_INVALID_ARGUMENT(4)` 而非 `KERN_INVALID_ADDRESS(1)`，据此怀疑 XNU `vm_map.c` 的 `if (named_entry->size < obj_offs + initial_size)` 守卫。本次：① 回读 `mach_make_memory_entry_64` 的 in/out `entrysize`；② 直接读内核里 `vm_named_entry->size`（+0x20）作为权威上限；③ 映射前显式校验并给出可读原因；④ 去掉 `VM_PROT_IS_MASK`；⑤ 失败日志追加 `prot`。**事后回算证明该守卫未触发，本版假设不成立**；且第 ④ 点移除 `VM_PROT_IS_MASK` 本身也是错的（v0.4.7 已恢复并说明原因） |
