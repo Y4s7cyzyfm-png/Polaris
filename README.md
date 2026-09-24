@@ -429,6 +429,50 @@ max_protection &= ~VM_PROT_IS_MASK;
 第 1 档到底报什么、`entryOffset` 由哪两项构成、
 `namedEntrySize` 与 `roundedsize` 为何不等。
 
+#### 与 KuaiDou（第三方逆向）的交叉验证
+
+对照一份 KuaiDou.ipa 的静态分析报告，逐条核对我们这条链路：
+
+| KuaiDou 组件 | 我们 | 结论 |
+|---|---|---|
+| `vm_map_find_entry` | `pr_vmmap_find_entry` | ✅ 等价 |
+| `vm_get_object` | `pr_vm_get_object` | ✅ 等价 |
+| `vm_create_shmem_with_object` | `pr_create_shmem_with_obj` | ✅ 等价 |
+| `vm_map_remote_page` | `polaris_vmmap_remote_page` | ✅ 等价 |
+| `task_get_ipc_port_kobject` | 已用 | ✅ 等价 |
+| **`vm_map_rb_walk`** | 用链表 `links.next` | ⚠️ 见下 |
+| **`kread_smrptr`** | **没有** | ⚠️ 见下 |
+
+两条**结构性差异**：
+
+1. **`vm_map_rb_walk` vs 链表遍历。** XNU 的 `vm_map_entry` 同时挂在
+   两个结构上：`links`（按地址排序的双向链表）和 `store`（红黑树）。
+   两条路径**内容相同**，所以结果应当一致；但 KuaiDou 走红黑树，
+   说明红黑树在异常布局下更稳。我们的链表遍历带环路检测与 4096 上限，
+   先记下这个差异，暂不改动。
+
+2. **`kread_smrptr` 用于读取带 SMR（Safe Memory Reclamation）保护的指针。**
+   `vm_map` 的 entry 链表在并发修改时用 SMR 保护。我们的
+   `pr_safe_kreadptr` 直接从内核读指针，**遇到正在被回收的 entry
+   可能读到脏值或 NULL**。这可以解释「为什么同一个地址，
+   有时能定位到 entry、有时 entryOffset 变成 0」。
+
+另外报告确认了两条与实现一致的细节：
+
+- **`ds_kread` 按最多 0x20 字节分块**，`ds_kwrite32` 是
+  read-modify-write。`sizeof(vm_map_entry)` ≈ 0x88 远超 0x20，
+  所以我们走 `ds_kwritezoneelement` 而非 `ds_kwrite32` —— **正确**。
+- **KuaiDou 的映射尺寸是 `0x8000`（32KB）**，不是整个 `vm_object`。
+  这提示我们：`named_entry->size` 未必等于 `vm_object` 的大小，
+  而 `mach_vm_map` 的 `offset + size` 必须落在它之内。
+
+> 用 XNU 源码核对我们使用的 offset，全部正确：
+> `_vm_map.hdr` 在 `+0x10`（前面是 `lck_rw_t lock`），
+> `hdr.links` = `{prev,next,start,end}` 各 8 字节，
+> 所以 `entry+0x8` = `links.next`、`entry+0x10` = `start`、
+> `entry+0x18` = `end`。`vm_map_entry.store` 在 `+0x20`，我们不需要它。
+
+
 ### 读取路径的分层
 
 修复后 `unitypatch.m` 的读取分成明确两层：
