@@ -659,63 +659,71 @@ uint64_t polaris_find_unity_framework_base(void) {
 }
 
 // ---------------------------------------------------------------------------
-// codesign 保险：给 smoba 的 vm_map 放行「失效页」
+// codesign 保险：清掉 smoba 的 CS_KILL / CS_HARD
 // ---------------------------------------------------------------------------
 //
-// ★ 为什么需要这一步（v0.5.0 真机崩溃的根因）
+// ★ 为什么需要这一步（真机崩溃的根因）
 //
 // 目标页位于 UnityFramework 的 __TEXT 段，是**已签名**的代码页。
-// 我们通过 vm_object 共享映射把这一页写脏之后，XNU 的 VM 会在页上记两笔账：
+// 我们通过 vm_object 共享映射把这一页写脏之后，XNU 的 VM 会在页上记下
+// vmp_wpmapped（曾被以可写方式映射进某个 pmap）与 vmp_dirty。
 //
-//   1) vmp_wpmapped —— 该页曾被「以可写方式映射进某个 pmap」；
-//   2) vmp_dirty     —— 页内容已被改过。
+// 之后 smoba 只要再碰这一页（执行到该页的指令，就是最常见的情况），
+// 就会走 vm_fault_enter() → vm_fault_cs_check_violation()：
 //
-// 之后 smoba 自己只要再碰这一页（哪怕只是读一个放在该页里的常量，
-// 或重新执行到该页的指令），就会走 vm_fault_enter()。那里出现：
-//
-//   if (cs_enforcement_enabled) {
-//       ...
-//       else if (vm_fault_cs_page_immutable(m, ..., prot) &&
-//                ((prot & VM_PROT_WRITE) || m->vmp_wpmapped)) {
-//           *cs_violation = TRUE;      // ← 中文注释：page 有被动过的风险
-//       }
+//   else if (vm_fault_cs_page_immutable(m, ..., prot) &&
+//            ((prot & VM_PROT_WRITE) || m->vmp_wpmapped)) {
+//       *cs_violation = TRUE;
 //   }
 //   → vm_fault_cs_handle_violation() → cs_invalid_page(vaddr, &cs_killed)
 //
-// cs_invalid_page()（bsd/kern/kern_cs.c）里只认 proc 的 csflags：
+// 而 cs_invalid_page()（bsd/kern/kern_cs.c）只认 proc 的 csflags：
 //
 //   if (flags & CS_KILL) { flags |= CS_KILLED; send_kill = 1; retval = 1; }
 //   ...
 //   if (send_kill) threadsignal(current_thread(), SIGKILL, EXC_BAD_ACCESS, FALSE);
 //
-// smoba 是平台二进制，csflags 带 CS_KILL，于是它收到 SIGKILL，
-// 崩溃报告里写的就是我们见到的那三行：
+// smoba 是平台二进制，csflags 带 CS_KILL，于是收 SIGKILL，
+// 崩溃报告里就是我们见到的那三行：
 //   termination = { namespace: CODESIGNING, code: 2, indicator: "Invalid Page" }
 //   ktriageinfo = "VM - (arg = 0x0) CL - "   （CL = CodeSigning）
-//   崩溃地址落在 UnityFramework __TEXT 区间内，且与补丁点同页
+//   faultingThread 的 frame 0 恰好停在 UnityFramework 的补丁页上
 //
-// 官方给「故意改自己代码」这种场景留了后门，就是 cs_allow_invalid()
-// （同一个文件，cs_allow_invalid() 尾部）：
+// ★ 官方后门是 cs_allow_invalid()（bsd/kern/kern_cs.c），它做了三件事：
 //
-//     proc_csflags_update(p, flags & ~(CS_KILL | CS_HARD));
+//     flags = proc_getcsflags(p) & ~(CS_KILL | CS_HARD);   // ① 清击杀位 ← 真正的解药
+//     proc_csflags_update(p, flags);
 //     ...
-//     vm_map_switch_protect(get_task_map(proc_task(p)), FALSE);
-//     vm_map_cs_debugged_set(get_task_map(proc_task(p)), TRUE);
+//     task_set_memory_ownership_transfer(proc_task(p), TRUE);
+//     vm_map_switch_protect(get_task_map(proc_task(p)), FALSE);   // ②
+//     vm_map_cs_debugged_set(get_task_map(proc_task(p)), TRUE);   // ③
 //
-// 也就是往 vm_map 里落两个布尔字段：cs_debugged=true、switch_protect=false。
-// 我们直接把这俩字段写进 smoba 的 vm_map，作用等价于「让系统认为
-// smoba 是被调试的进程」，cs_invalid_page() 收到 CS_KILL 就会放行而不是击杀。
+// ⚠️ 我在上一版（v0.5.0）**只做了 ②③，漏掉了真正起作用的 ①**。
+// 这是错的判断：查遍 XNU 源码，`cs_debugged` 唯一的用处是
+// vm_map_entry_is_overwritable() 里那条 JIT 覆盖检查（mementry.c:9385），
+// 它**完全不参与** cs_invalid_page() 的击杀判定 —— 那只看 proc 的 csflags。
+// ②③ 之所以出现在 cs_allow_invalid() 里，是因为它们服务于「被调试进程的
+// 额外特权」，而不是解药本身。
+//
+// 所以本版以 ① 为主修法，②③ 作为并列的补充（成本很低，顺手落上）。
 //
 // 参考 XNU main：
-//   osfmk/vm/vm_map.h      struct vm_map { ... boolean_t cs_debugged:1;
-//                                          boolean_t switch_protect:1; ... }
-//   bsd/kern/kern_cs.c     cs_invalid_page() / cs_allow_invalid()
-//   osfmk/vm/vm_fault.c    vm_fault_cs_check_violation() / vm_fault_cs_handle_violation()
+//   bsd/kern/kern_cs.c        cs_invalid_page() / cs_allow_invalid()
+//   bsd/sys/proc_ro.h         struct proc_ro { ... uint32_t p_csflags; ... }
+//   bsd/kern/cs_blobs.h       CS_KILL / CS_HARD / CS_DEBUGGED
+//   osfmk/vm/vm_fault.c       vm_fault_cs_check_violation() / vm_fault_cs_handle_violation()
+//   osfmk/vm/vm_map_xnu.h     struct _vm_map 的 cs_debugged / switch_protect 位
 
-/// 已成功给 smoba 的 vm_map 落过保险
+/// 已成功给 smoba 落过保险
 static bool gCsRelaxed = false;
 
-/// `struct _vm_map` 里那个 `unsigned int` 位域字的位置与掩码。
+/// csflags 里决定「页失效是否击杀进程」的两位（bsd/kern/cs_blobs.h）
+#define UP_CS_HARD   0x00000100u   /* 无效页 → 让映射操作失败，进程保持有效 */
+#define UP_CS_KILL   0x00000200u   /* 无效页 → 直接 SIGKILL */
+#define UP_CS_VALID  0x00000001u
+#define UP_CS_DEBUGGED 0x10000000u
+
+/// `struct _vm_map` 里那个 `unsigned int` 位域字的掩码。
 ///
 /// 依据 XNU `osfmk/vm/vm_map_xnu.h` 的 `struct _vm_map`：
 ///
@@ -736,17 +744,62 @@ static bool gCsRelaxed = false;
 #define UP_VMMAP_BITS_MASK_SWITCH_PROTECT   (1u << 4)    /* 0x00000010 */
 #define UP_VMMAP_BITS_MASK_CS_DEBUGGED      (1u << 15)   /* 0x00008000 */
 
-/// 给目标进程的 vm_map 落 cs_debugged / switch_protect，放行「被写脏的代码页」。
+/// 清掉 smoba 的 CS_KILL / CS_HARD —— 这是让「页失效」不再击杀进程的关键。
 ///
-/// @return 是否两个位都写成功。
-static bool up_relax_target_codesign(void) {
-    if (gCsRelaxed) return true;
+/// 路径：proc -> p_proc_ro -> proc_ro.p_csflags
+///
+/// @return 是否成功读到并写回。
+static bool up_clear_target_kill_flags(void) {
     if (!ds_is_ready()) return false;
-    if (off_vm_map_cs_bits == 0) {
-        // 偏移表没初始化（老设备分支）。不用慌，只是少了这层保险，
-        // 仍然继续写入 —— 内透本身是可用的，只是崩溃风险回升。
+    if (off_proc_p_proc_ro == 0 || off_proc_ro_p_csflags == 0) {
+        // 偏移表没就绪 —— 不能瞎写，直接放弃（上层会记进日志）。
         return false;
     }
+
+    uint64_t proc = proc_find_by_name(POLARIS_GAME_PROCESS_NAME);
+    if (!proc || !ds_isvalid(proc)) return false;
+
+    bool okProcRo = false;
+    uint64_t procRo = up_safe_kreadptr(proc + off_proc_p_proc_ro);
+    // up_safe_kreadptr 已做 kaddr 校验；再用 ds_isvalid 复核一次
+    okProcRo = (procRo != 0) && ds_isvalid(procRo);
+    if (!okProcRo) return false;
+
+    uint64_t csflagsAddr = procRo + off_proc_ro_p_csflags;
+
+    bool okResult = false;
+    @try {
+        uint32_t flags = ds_kread32(csflagsAddr);
+
+        // 与 cs_allow_invalid() 一致：清 CS_KILL | CS_HARD；
+        // 若原先是有效签名，则顺带置 CS_DEBUGGED（表明这是「被调试」的进程）。
+        uint32_t want = flags & ~(UP_CS_KILL | UP_CS_HARD);
+        if (flags & UP_CS_VALID) {
+            want |= UP_CS_DEBUGGED;
+        }
+
+        if (flags != want) {
+            ds_kwrite32(csflagsAddr, want);
+        }
+
+        uint32_t back = ds_kread32(csflagsAddr);
+        okResult = (back & (UP_CS_KILL | UP_CS_HARD)) == 0;
+    }
+    @catch (NSException *e) {
+        (void)e;   // 读失败就当没落上，绝不把 ObjC 异常抛到 Swift 边界（会 SIGABRT）
+    }
+    @catch (...) {
+    }
+
+    return okResult;
+}
+
+/// 给目标进程的 vm_map 落 cs_debugged / switch_protect（cs_allow_invalid 的 ②③）。
+///
+/// @return 是否两个位都写成功。
+static bool up_relax_target_vmmap(void) {
+    if (!ds_is_ready()) return false;
+    if (off_vm_map_cs_bits == 0) return false;
 
     uint64_t proc = proc_find_by_name(POLARIS_GAME_PROCESS_NAME);
     if (!proc || !ds_isvalid(proc)) return false;
@@ -757,7 +810,7 @@ static bool up_relax_target_codesign(void) {
     uint64_t vmMap = task_get_vm_map(task);
     if (!vmMap || !ds_isvalid(vmMap)) return false;
 
-    // 位域字基址：vm_map + off_vm_map_hdr + off_vm_map_cs_debugged
+    // 位域字基址：vm_map + off_vm_map_hdr + off_vm_map_cs_bits
     // （off_vm_map_hdr = 0x10 落在 vm_map_header，off_vm_map_cs_bits = 0x80
     //   是位域字相对 header 的偏移，合起来 = 0x90）
     uint64_t bitsAddr = vmMap + off_vm_map_hdr + off_vm_map_cs_bits;
@@ -777,14 +830,33 @@ static bool up_relax_target_codesign(void) {
                    (back & UP_VMMAP_BITS_MASK_SWITCH_PROTECT) == 0;
     }
     @catch (NSException *e) {
-        (void)e;   // 读失败就当没落上，不抛到 Swift 边界（会 SIGABRT）
+        (void)e;
     }
     @catch (...) {
     }
 
-    // 只有真的生效才算数：写失败时 smoba 仍可能被击杀，别谎报。
-    gCsRelaxed = okResult;
-    return gCsRelaxed;
+    return okResult;
+}
+
+/// 落 codesign 保险（主修法 + 补充位）。
+///
+/// @param outCleared 输出：CS_KILL/CS_HARD 是否确已清掉（主修法结果）
+/// @param outVmmap   输出：vm_map 的 cs_debugged/switch_protect 是否落上（补充）
+/// @return 主修法是否成功
+static bool up_relax_target_codesign(bool *outCleared, bool *outVmmap) {
+    bool cleared = gCsRelaxed ? true : up_clear_target_kill_flags();
+    if (cleared) gCsRelaxed = true;
+
+    bool vmmap = cleared ? up_relax_target_vmmap() : false;
+
+    if (outCleared) *outCleared = cleared;
+    if (outVmmap)   *outVmmap   = vmmap;
+    return cleared;
+}
+
+/// 把「击杀位是否已清」翻成人话，供日志拼串使用。
+static const char *up_cs_state_text(bool cleared) {
+    return cleared ? "已清" : "未清（偏移缺失或写入被拒）";
 }
 
 // ---------------------------------------------------------------------------
@@ -854,11 +926,13 @@ bool polaris_enable_transparent_wall(void) {
     if (up_user_read_insn(gTargetAddr, &currentInsn) &&
         currentInsn == UNITY_PATCH_VALUE) {
         // 即便不写也要把保险补上：上一次进程可能已重启过。
-        bool relaxed = up_relax_target_codesign();
+        bool cleared = false, vmmapOk = false;
+        up_relax_target_codesign(&cleared, &vmmapOk);
         gEnabled = true;
-        up_set_message("内透已开启（该页本就是补丁值）· 0x%llx · %s",
+        up_set_message("内透已开启（该页本就是补丁值）· 0x%llx · csflags击杀位%s · vm_map补充位%s",
                        (unsigned long long)gTargetAddr,
-                       relaxed ? "codesign 保险已就位" : "codesign 保险未落上");
+                       up_cs_state_text(cleared),
+                       vmmapOk ? "已落" : "未落");
         return true;
     }
 
@@ -866,7 +940,8 @@ bool polaris_enable_transparent_wall(void) {
     // 单独写这一步是**不够**的（cs_killed 的判定在页状态上，写脏之后
     // smoba 再碰这一页仍会走到 cs_invalid_page），但写完之后 smoba
     // 立刻就会重新执行到这条指令 —— 只有先放了保险，那次冲突才不会被判死。
-    bool relaxed = up_relax_target_codesign();
+    bool cleared = false, vmmapOk = false;
+    up_relax_target_codesign(&cleared, &vmmapOk);
 
     // ★ 写入走 vm_object 共享映射（目标页已映射进本进程），不是 ds_kwrite32。
     // ds_kwrite32 只认内核地址，写用户态地址会被 ds_isvalid 拒掉。
@@ -890,11 +965,12 @@ bool polaris_enable_transparent_wall(void) {
     }
 
     gEnabled = true;
-    // 日志里明确标出 cs_debugged 是否落上 —— 它决定 smoba 会不会被击杀，
-    // 是这一版最需要真机确认的一个开关。
-    up_set_message("内透已开启 · 0x%llx（原值 0x%08X → 0x%08X）· %s",
+    // 日志里明确标出 p_csflags 的击杀位是否清掉 —— 这是决定 smoba 会不会
+    // 被 cs_invalid_page() 击杀的**唯一**开关，也是这一版最需要真机确认的一项。
+    up_set_message("内透已开启 · 0x%llx（原值 0x%08X → 0x%08X）· csflags击杀位%s · vm_map补充位%s",
                    (unsigned long long)gTargetAddr, gOriginalInstruction, UNITY_PATCH_VALUE,
-                   relaxed ? "codesign 保险已就位" : "codesign 保险未落上（偏移表缺失或写入被拒）");
+                   up_cs_state_text(cleared),
+                   vmmapOk ? "已落" : "未落");
     return true;
 }
 

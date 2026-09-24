@@ -131,6 +131,7 @@ uint32_t off_proc_p_textvp = 0;
 uint32_t off_proc_p_name = 0;
 uint32_t off_proc_ro_pr_task = 0;
 uint32_t off_proc_ro_p_ucred = 0;
+uint32_t off_proc_ro_p_csflags = 0;
 uint32_t off_ucred_cr_label = 0;
 uint32_t off_task_itk_space = 0;
 uint32_t off_task_threads_next = 0;
@@ -234,6 +235,7 @@ static off32entry const koff32entries[] = {
     OFFSET32(off_proc_p_name),
     OFFSET32(off_proc_ro_pr_task),
     OFFSET32(off_proc_ro_p_ucred),
+    OFFSET32(off_proc_ro_p_csflags),
     OFFSET32(off_ucred_cr_label),
     OFFSET32(off_task_itk_space),
     OFFSET32(off_task_threads_next),
@@ -756,6 +758,7 @@ void offsets_init(void) {
         off_proc_p_name = 0x579;
         off_proc_ro_pr_task = 0x8;
         off_proc_ro_p_ucred = 0x20;
+        off_proc_ro_p_csflags = 0x24;
         off_ucred_cr_label = 0x78;
         off_task_itk_space = 0x300;
         off_task_threads_next = 0x58;
@@ -1019,6 +1022,7 @@ void offsets_init(void) {
         off_proc_p_name = 0x57d;
         off_proc_ro_pr_task = 0x8;
         off_proc_ro_p_ucred = 0x20;
+        off_proc_ro_p_csflags = 0x24;
         off_ucred_cr_label = 0x78;
         off_task_itk_space = 0x318;
         off_task_threads_next = 0x50;
@@ -1194,6 +1198,7 @@ void offsets_init(void) {
         off_thread_ast = 0x39C;
         off_thread_task_threads_next = 0x368;
         off_proc_ro_p_ucred = 0x28;
+        off_proc_ro_p_csflags = 0x24;
         off_task_task_exc_guard = 0x5FC;
 
         if(isA13Above) {
@@ -1348,6 +1353,7 @@ void offsets_init(void) {
         off_proc_p_name = 0x57D;
         off_proc_ro_pr_task = 0x8;
         off_proc_ro_p_ucred = 0x28;
+        off_proc_ro_p_csflags = 0x24;
         off_ucred_cr_label = 0x78;
         off_task_itk_space = 0x310;
         off_task_threads_next = 0x50;
