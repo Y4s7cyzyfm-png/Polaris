@@ -270,7 +270,7 @@
 					"$(inherited)",
 					"$(SRCROOT)/Polaris/Kernel/Vendor/lib",
 				);
-				MARKETING_VERSION = 0.4.7;
+				MARKETING_VERSION = 0.4.8;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
 					"-lxpf",
@@ -318,7 +318,7 @@
 					"$(inherited)",
 					"$(SRCROOT)/Polaris/Kernel/Vendor/lib",
 				);
-				MARKETING_VERSION = 0.4.7;
+				MARKETING_VERSION = 0.4.8;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
 					"-lxpf",

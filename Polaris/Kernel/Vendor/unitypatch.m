@@ -103,7 +103,12 @@ static bool gEnabled = false;
 static bool gHaveBackup = false;
 static uint32_t gOriginalInstruction = 0;
 
-static char gMessage[256] = {0};
+/// 最近一次消息。
+///
+/// ★ v0.4.8 从 256 扩到 1024：内透失败时这里会拼接 remotepage 的
+/// **逐档映射明细**（最多 12 档 × ~45 字节），256 字节会把关键的后半段
+/// 截掉 —— 真机日志里那条被截断的 `obj=0xffffffe66cffed00 ob` 就是证据。
+static char gMessage[1024] = {0};
 
 static void up_set_message(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void up_set_message(const char *fmt, ...) {
@@ -653,7 +658,7 @@ bool polaris_enable_transparent_wall(void) {
         if (!ok) {
             // 把 remotepage 记录的**真实失败原因**带出来，
             // 否则只能瞎猜「映像未加载」——上一版就是这么误判的。
-            char why[192] = {0};
+            char why[1024] = {0};
             polaris_remote_describe(why, (int)sizeof(why));
             up_set_message("读目标地址 0x%llx 失败（基址 0x%llx）· %s",
                            (unsigned long long)gTargetAddr,
@@ -678,7 +683,7 @@ bool polaris_enable_transparent_wall(void) {
     // ds_kwrite32 只认内核地址，写用户态地址会被 ds_isvalid 拒掉。
     if (!up_user_write(gTargetAddr, &(uint32_t){ UNITY_PATCH_VALUE }, sizeof(uint32_t))) {
         gEnabled = false;
-        char detail[192] = {0};
+        char detail[1024] = {0};
         polaris_remote_describe(detail, (int)sizeof(detail));
         up_set_message("内透写入失败（%s）", detail[0] ? detail : "无法映射目标页");
         return false;
@@ -721,7 +726,7 @@ bool polaris_disable_transparent_wall(void) {
     }
 
     if (!up_user_write(gTargetAddr, &gOriginalInstruction, sizeof(gOriginalInstruction))) {
-        char detail[192] = {0};
+        char detail[1024] = {0};
         polaris_remote_describe(detail, (int)sizeof(detail));
         up_set_message("内透还原失败（%s）", detail[0] ? detail : "无法映射目标页");
         return false;

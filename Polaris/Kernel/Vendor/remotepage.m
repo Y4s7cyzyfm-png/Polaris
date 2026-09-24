@@ -120,6 +120,14 @@ struct pr_vmobj {
     uint64_t address;      ///< vm_object 内核地址
     uint64_t objectOffset; ///< vm_object 内偏移（页对齐）
     uint64_t entryOffset;  ///< 目标页在对象内的偏移
+
+    /// ★ v0.4.8：entryOffset 的两个**原始输入**。
+    ///
+    /// entryOffset = (address - entry.start) + (vme_offset << 12)
+    /// 只记录结果的话，一旦数值反常就无法判断是「找错了 entry」
+    /// 还是「vme_offset 太大」。带上这两个原始值就能直接验算。
+    uint64_t entryStart;   ///< 命中的 vm_map_entry 的 links.start
+    uint64_t rawVmeOffset; ///< vme_offset 的原始（未 <<12）值
 };
 
 #define PR_PACKED_PTR_BITS                31
@@ -153,7 +161,13 @@ extern kern_return_t mach_vm_map(vm_map_t target_task, mach_vm_address_t *addres
 
 static uint64_t gRemoteVmMap = 0;     ///< 目标进程（smoba）的 vm_map
 static uint32_t gPageShift  = 0;      ///< 页大小 shift（iOS 16KB → 14）
-static char     gMessage[256] = {0};
+
+/// 最近一次消息。
+///
+/// ★ v0.4.8 从 256 扩到 1024：失败信息现在要带**逐档明细**
+/// （每档 `off/size/prot -> ret` 约 45 字节 × 最多 12 档 ≈ 540 字节），
+/// 256 会把最关键的后半段截掉 —— 那正是排查要看的东西。
+static char     gMessage[1024] = {0};
 
 /// 最近一次成功映射用的档位标签（写进 describe 输出）。
 /// 这一项直接回答「阶梯第几档生效」——是排查 offset 语义的关键证据。
@@ -162,6 +176,16 @@ static char gLastGoodLabel[96] = {0};
 /// vm_object / entry 的现场数值（在 pr_create_shmem_with_obj 里填）。
 /// pr_set_message 会被后续覆盖，所以单独留一份，供 describe 输出。
 static char gEntryTrace[192] = {0};
+
+/// ★ v0.4.8：**逐档**的失败明细。
+///
+/// 起因：v0.4.7 的失败信息只报「末档」，前面几档的返回码全部被循环
+/// 覆盖。真机日志里只看到 `末档 off=0 size=0x8000000 prot=0x7 (17)`，
+/// 于是既不知道第 1 档（`prot=ALL|IS_MASK`）报的是哪个错，也不知道
+/// 第 1/2/3 档的 offset 究竟是 0 还是 `0x9e3c000` —— 排查完全靠猜。
+///
+/// 这里累积每一档的 `off/size/prot -> ret` 摘要，失败时一次性打出。
+static char gTierTrace[512] = {0};
 
 static void pr_set_message(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void pr_set_message(const char *fmt, ...) {
@@ -357,6 +381,8 @@ static struct pr_vmobj pr_vm_get_object(uint64_t vmMap, uint64_t address) {
     result.address      = vmeobj;
     result.objectOffset = objoffs;
     result.entryOffset  = entryoffs;
+    result.entryStart   = entry.links.start;
+    result.rawVmeOffset = vmeoffraw;
     return result;
 }
 
@@ -393,16 +419,33 @@ static polaris_vmshmem_t pr_create_shmem_with_obj(struct pr_vmobj *object) {
 
     // ★ 诊断：把关键数值全报出来。
     //
-    // 记入 gEntryTrace 单独保存（pr_set_message 会被后续覆盖），
-    // 里面含 entry.start 与 entryOffset 的构成项，用来回答
-    // 「entryOffset 为什么是这个值」——v0.4.4 与 v0.4.6 两次真机
-    // 的 entryOffset 分别是 0x9e3c000 和 0x0，必须能区分成因。
+    // 记入 gEntryTrace 单独保存（pr_set_message 会被后续覆盖）。
+    //
+    // ★ v0.4.8 扩充：加上 entryStart / rawVmeOffset 两个**原始输入**。
+    //   验算式：entryOffset == (vmAddress - entryStart) + (rawVmeOffset << 12)
+    //   只记结果的话，数值反常时无法区分是「entry 找错了」还是
+    //   「vme_offset 过大」——v0.4.4 与 v0.4.6/7 的真机 entryOffset
+    //   分别是 0x9e3c000 与 0x0，必须能一眼看出成因。
     snprintf(gEntryTrace, sizeof(gEntryTrace),
-             "obj=0x%llx objsz=0x%llx entryOff=0x%llx objOff=0x%llx",
+             "obj=0x%llx objsz=0x%llx entryOff=0x%llx objOff=0x%llx "
+             "eStart=0x%llx vmeOffraw=0x%llx addr=0x%llx",
              (unsigned long long)object->address,
              (unsigned long long)roundedsize,
              (unsigned long long)object->entryOffset,
-             (unsigned long long)object->objectOffset);
+             (unsigned long long)object->objectOffset,
+             (unsigned long long)object->entryStart,
+             (unsigned long long)object->rawVmeOffset,
+             (unsigned long long)object->vmAddress);
+
+    // 把 entryOffset 的构成写进日志（会被后续覆盖，但 gEntryTrace 留底）。
+    // 若 (addr - eStart) 恰好等于 entryOffset，说明 vme_offset 为 0，
+    // 即这个 entry 不是「对象从段首开始」的常规情形。
+    if (object->rawVmeOffset != 0) {
+        pr_set_message("注意：vme_offset 非 0（raw=0x%llx），"
+                       "entryOffset 含对象内偏移 0x%llx",
+                       (unsigned long long)object->rawVmeOffset,
+                       (unsigned long long)object->objectOffset);
+    }
 
     // 目标偏移若越出 vm_object 覆盖范围，mach_vm_map 很可能失败。
     // 这里**只记录不拦截**：离线无法确证 vm_object 的 size 语义
@@ -810,15 +853,23 @@ static polaris_vmshmem_t pr_create_shmem_with_obj(struct pr_vmobj *object) {
     // 不精确的映射虽然可用，但写入会落到对象起始处而非目标页。
     bool hitExact = false;
 
+    // ★ v0.4.8：逐档留痕。每个候选无论成败都记一行
+    //   `off/size/prot -> ret`，失败时整条打出来。
+    //   这样下一次真机日志能直接看出「哪一档、什么参数、什么错」，
+    //   不必再靠末档反推。
+    gTierTrace[0] = '\0';
+    size_t traceUsed = 0;
+    int    skipped    = 0;
+
     for (int i = 0; i < ntries; i++) {
         pr_maptry_t t = tries[i];
 
         // 该候选的 size 不能为 0，否则内核必然拒
-        if (t.size == 0) continue;
+        if (t.size == 0) { skipped++; continue; }
         // size 必须是页对齐的，否则 vm_sanitize_size 会失败
-        if (t.size & (PR_MAP_PAGE_SIZE - 1)) continue;
+        if (t.size & (PR_MAP_PAGE_SIZE - 1)) { skipped++; continue; }
         // offset 必须是页对齐的（mach_vm_map 的硬要求）
-        if (t.offset & (PR_MAP_PAGE_SIZE - 1)) continue;
+        if (t.offset & (PR_MAP_PAGE_SIZE - 1)) { skipped++; continue; }
 
         mach_vm_address_t addr = 0;
         ret = mach_vm_map(mach_task_self_, &addr, t.size, 0, VM_FLAGS_ANYWHERE,
@@ -830,6 +881,19 @@ static polaris_vmshmem_t pr_create_shmem_with_obj(struct pr_vmobj *object) {
         lastSize   = t.size;
         lastProt   = t.prot;
         lastLabel  = t.label;
+
+        // 累积这一档的结果（截断保护：宁可少记也不溢出）
+        if (traceUsed + 96 < sizeof(gTierTrace)) {
+            int n = snprintf(gTierTrace + traceUsed, sizeof(gTierTrace) - traceUsed,
+                             "%s#%d off=0x%llx sz=0x%llx prot=0x%x -> %s(0x%x) | ",
+                             i ? "" : "",
+                             i + 1,
+                             (unsigned long long)t.offset,
+                             (unsigned long long)t.size,
+                             (unsigned)t.prot,
+                             mach_error_string(ret), (unsigned)ret);
+            if (n > 0) traceUsed += (size_t)n;
+        }
 
         if (ret == KERN_SUCCESS) {
             mappedaddr = addr;
@@ -849,29 +913,28 @@ static polaris_vmshmem_t pr_create_shmem_with_obj(struct pr_vmobj *object) {
         // KERN_INVALID_ADDRESS(1) / KERN_INVALID_RIGHT(2) / (4) 等都继续试下一档；
         // 这些失败不会在内核里留下残留映射，重试是安全的。
     }
+    (void)skipped;
 
     // 把「是否精确」写进 shmem，供上层决定能不能用于写入。
     // 这一位是安全闸门：不精确的映射只允许读，绝不允许写。
     shmem.exact = hitExact;
 
     if (mappedaddr == 0) {
-        // 全部候选都失败：把最后一档的完整现场报出来（含每一档都没成功这一事实）。
+        // 全部候选都失败：把最后一档的完整现场报出来。
         //
-        // ★ v0.4.7：末尾追加 gEntryTrace。
-        //   原因：object->entryOffset / objectOffset 这两个值在
-        //   pr_create_shmem_with_obj 里只经 pr_set_message 一闪而过，
-        //   随后就被本函数的失败信息覆盖掉。而它们恰恰是判断
-        //   「offset 语义走 O1 还是 O2」的唯一依据 —— 必须在失败行里
-        //   无条件带出，否则下一次真机日志又要靠猜。
+        // ★ v0.4.8：额外打出**逐档明细** gTierTrace。
+        //   v0.4.7 只报末档，导致「第 1 档 prot=ALL|IS_MASK 到底报什么错」
+        //   完全不可见 —— 而这个信息恰恰是判断权限假设是否成立的关键。
         pr_set_message("mach_vm_map 全部 %d 档均失败。末档 %s：%s(0x%x) "
-                       "off=0x%llx size=0x%llx objsize=0x%llx prot=0x%x · %s",
+                       "off=0x%llx size=0x%llx objsize=0x%llx prot=0x%x\n"
+                       "  逐档: %s",
                        ntries, lastLabel,
                        mach_error_string(lastRet), (unsigned)lastRet,
                        (unsigned long long)lastOffset,
                        (unsigned long long)lastSize,
                        (unsigned long long)roundedsize,
                        (unsigned)lastProt,
-                       gEntryTrace[0] ? gEntryTrace : "(无 entry 现场)");
+                       gTierTrace[0] ? gTierTrace : "(无明细)");
     }
 
     // 8) 释放临时载体（映射已独立存在）
@@ -998,7 +1061,10 @@ static void pr_page_cache_put(uint64_t remotePage, uint64_t localPage, bool exac
 /// 首次映射失败的详细原因。pr_set_message 会被后续调用覆盖，
 /// 而映射失败往往发生在深层（pr_create_shmem_with_obj 内部），
 /// 于是到上层只剩一句笼统的话。这里把第一次失败的完整原因单独留存。
-static char gFirstFailDetail[192] = {0};
+///
+/// ★ v0.4.8 从 192 扩到 1024：现在要装下逐档明细，
+/// 192 字节会在 `逐档:` 刚开头处就被截断。
+static char gFirstFailDetail[1024] = {0};
 
 /// 最近一次成功映射用的档位标签（写进 describe 输出）。
 
@@ -1058,6 +1124,7 @@ void polaris_remote_flush_cache(void) {
     gFirstFailDetail[0] = '\0';
     gLastGoodLabel[0] = '\0';
     gEntryTrace[0] = '\0';
+    gTierTrace[0] = '\0';
 }
 
 // ---------------------------------------------------------------------------

@@ -528,7 +528,7 @@ BOOL PolarisAcquireGameProcess(void) {
     uint64_t procAddr = 0;
     bool found = polaris_find_game_process(&pid, &procAddr);
 
-    char message[256] = {0};
+    char message[1024] = {0};
     polaris_describe_game_process(message, (int)sizeof(message));
     NSString *status = message[0] ? @(message) : @"获取游戏进程失败";
 
@@ -588,7 +588,7 @@ BOOL PolarisSetTransparentWall(BOOL enable) {
         // 关闭：还原原始指令，不算错误路径
         polaris_set_error(@"");
         bool ok = polaris_set_transparent_wall(false);
-        char message[256] = {0};
+        char message[1024] = {0};
         polaris_describe_transparent_wall(message, (int)sizeof(message));
         os_unfair_lock_lock(&g_stateLock);
         g_wallStatus = message[0] ? @(message) : @"内透已关闭";
@@ -605,7 +605,7 @@ BOOL PolarisSetTransparentWall(BOOL enable) {
     // 同步执行：内核 vm_map 遍历 + 一次 4 字节写入，耗时极短。
     bool ok = polaris_set_transparent_wall(true);
 
-    char message[256] = {0};
+    char message[1024] = {0};
     polaris_describe_transparent_wall(message, (int)sizeof(message));
     NSString *status = message[0] ? @(message) : @"内透操作失败";
 

@@ -355,14 +355,79 @@ max_protection &= ~VM_PROT_IS_MASK;
   因为映射是共享的，写错页等于**真的改到游戏进程的对象第 0 页**，
   比直接失败严重得多。
 
-#### 诊断留痕
+#### 第三次真机（v0.4.7）：4 档全失败，但**信息被截断了**
 
-失败信息末尾现在无条件追加 `gEntryTrace`
-（`obj / objsz / entryOff / objOff` 四个数）。原因是：
-这四个值原先只在 `pr_create_shmem_with_obj()` 里经
-`pr_set_message` 一闪而过，随后就被 `mach_vm_map` 的失败信息覆盖，
-导致下一次真机排查又得靠猜。成功时则记录 `gLastGoodLabel`
-（命中的档位编号），显示在「跨进程访问就绪 · …」那行里。
+```
+读目标地址 0x123bc3824 失败（基址 0x119d84000）
+· mach_vm_map 全部 4 档均失败。末档 off=0 size=namedEntrySize(不精确)：
+  (os/kern) invalid right(0x11)
+  off=0x0 size=0x8000000 objsize=0x16584000 prot=0x7
+  · obj=0xffffffe66cffed00 ob        ← 就这样断了
+```
+
+这一版**推进了**（档数从 1 涨到 4，说明二维展开生效），
+但也暴露了两个问题。
+
+**问题一：只能看到末档。** 前 3 档（尤其第 1 档 `prot=ALL|IS_MASK`）
+的返回码全被循环覆盖。而「第 1 档报什么错」恰恰是判断
+`VM_PROT_IS_MASK` 假设是否成立的关键 —— 看不到就只能猜。
+
+**问题二：日志被截断。** `· obj=0xffffffe66cffed00 ob` 后面没了。
+逐层查下来是四个缓冲区太小：
+
+| 位置 | 原大小 | 现在 |
+|---|---|---|
+| `remotepage.m` `gMessage` | 256 | 1024 |
+| `remotepage.m` `gFirstFailDetail` | 192 | 1024 |
+| `unitypatch.m` `gMessage` | 256 | 1024 |
+| `unitypatch.m` `why` / `detail` | 192 | 1024 |
+| **`PolarisBridge.mm` `message`**（×3） | 256 | 1024 |
+
+最后一行才是真正的截断点：`remotepage` 辛苦拼出的长信息，
+到了 `char message[256]` 又被砍回 256 字节。
+
+> 教训：诊断信息在 C→OC 的边界上被静默截断，是最难发现的一类问题。
+> 排查时不要把「日志短」当成「信息本来就少」。
+
+#### 数值核对（本轮）
+
+| 项 | 值 | 判定 |
+|---|---|---|
+| `target - base` | `0x123bc3824 - 0x119d84000` = `0x9e3f824` | ✅ 与内透偏移完全一致 |
+| `namedEntrySize` | `0x8000000` = 128 MB | ⚠️ 与 `roundedsize`(`0x16584000` = 357 MB) 不符，待查 |
+| `objsize` | `0x16584000` = 357 MB | 与 entry 128 MB 不同量级 |
+| `obj` | `0xffffffe66cffed00` | ✅ 在 `[VM_MIN, VM_MAX]` 内且 64 字节对齐 |
+
+`obj` 是合法的（落在 `0xffffffdc00000000 ~ 0xfffffffbffffffff` 之间），
+所以「压缩指针解包错误」这个怀疑被排除。
+
+> 顺带澄清一个**看着像 bug 其实不是**的点：
+> `entry.vme_offset = object->objectOffset;` 写的是字节值，
+> 而字段语义是 4KB 单位（读路径用 `VME_OFFSET(x) = x << 12`），
+> 看起来放大了 4096 倍。但 `mach_vm_map` 走的是 **named_entry** 路径，
+> 用的是 `named_entry->offset` 而非 `vme_offset`，所以这处写入
+> 不影响映射成败 —— Rein 原版就是这么写的，属于无副作用的历史遗留。
+
+#### v0.4.8：先把「看得见」做对
+
+连续三轮都在「靠末档反推」上吃亏，所以这一版**不加新假设**，
+只把日志做够：
+
+1. **逐档留痕 `gTierTrace`** —— 每档记一行
+   `#n off=0x.. sz=0x.. prot=0x.. -> err(0x..)`，失败时整条打出。
+2. **`gEntryTrace` 补上原始输入** —— 增加 `eStart`(`entry.links.start`)
+   与 `vmeOffraw`，使 `entryOffset` 可以现场验算：
+   ```
+   entryOffset ?= (vmAddress - entryStart) + (vmeOffraw << 12)
+   ```
+   只记结果的话，数值反常时无法区分「找错了 entry」还是「vme_offset 过大」。
+3. **`vme_offset` 非 0 时主动告警** —— 常规 Mach-O `__TEXT` 的
+   `vme_offset` 恒为 0，非 0 说明这个 entry 不是「对象从段首开始」。
+4. **通路上所有消息缓冲区统一扩到 1024**（见上表）。
+
+目标是让 v0.4.8 的真机日志**一次就能定位**：
+第 1 档到底报什么、`entryOffset` 由哪两项构成、
+`namedEntrySize` 与 `roundedsize` 为何不等。
 
 ### 读取路径的分层
 
@@ -431,7 +496,7 @@ open Polaris.xcodeproj   # Xcode 16+ 打开，⌘R 运行（真机 arm64e）
 |---|---|---|
 | `Polaris/SettingsView.swift` | `telegramURL` | `https://t.me/polaris_channel` |
 | `Polaris.xcodeproj/project.pbxproj` | `PRODUCT_BUNDLE_IDENTIFIER`（Debug/Release 两处） | `com.polaris.toolkit` |
-| `codemagic.yaml` | `BUNDLE_ID` / `APP_VERSION` | `com.polaris.toolkit` / `0.4.7` |
+| `codemagic.yaml` | `BUNDLE_ID` / `APP_VERSION` | `com.polaris.toolkit` / `0.4.8` |
 
 > CI 里 `MARKETING_VERSION` 现在取 `${APP_VERSION}`（此前被硬编码成 `0.2.0`，
 > 会导致 pbxproj 里的版本号在 CI 构建时被覆盖——崩溃日志里 `app_version: 0.2.0`
@@ -475,7 +540,8 @@ Polaris/
 
 | 版本 | 变更 |
 |---|---|
-| 0.4.7 | **修复 `(os/kern) invalid right(0x11)`，并修正 v0.4.6 阶梯的两处缺陷**。真机 v0.4.6 日志把错误码从 `KERN_INVALID_ARGUMENT(4)` 推进到 `KERN_INVALID_RIGHT(17)`——**offset/size 那层已经通过**，说明 v0.4.6 的阶梯方向对了。剩下的拒绝点是 `vm_map.c:4184/4189` 的权限子集校验：entry 是 `R\|W`(`0x3`)，map 请求 `VM_PROT_ALL`(`0x7`)，`(0x3 & 0x7) != 0x7` → 拒。**① 恢复 `VM_PROT_IS_MASK`(`0x40`) 作为首选 prot 候选**：v0.4.5 以「语义用错」为由移除它是**错的**，它其实是 XNU 的权限收敛机制（置位后内核先做 `cur_protection &= named_entry->protection`，把 `0x7` 收缩成 `0x3`），不影响「映射后能否读写」，只影响「请求权限怎么收敛」。**② `mach_make_memory_entry_64` 的 protection 提到 `VM_PROT_ALL`**（失败退回 `READ\|WRITE`），让「请求权限 ⊆ entry 权限」恒成立。**③ 阶梯从一维改为二维笛卡尔积** {`entryOffset`, `entryOffset-objectOffset`} × {`ALL\|IS_MASK`, `ALL`, `RW`}：v0.4.6 所有 offset 候选的生成条件都写死 `mapOffset != 0`，而真机这次 `entryOffset == 0`，于是只剩 1 档，正好对应日志里的「全部 1 档均失败」。**④** 失败信息末尾无条件追加 `gEntryTrace`（`obj/objsz/entryOff/objOff`），避免这四个关键数被后续 `pr_set_message` 覆盖 |
+| 0.4.8 | **修「诊断信息被截断」，不再新增内核侧假设**。第三轮真机（v0.4.7）档数已从 1 涨到 4（二维展开生效），但仍报 `invalid right(0x11)`；且日志止于 `· obj=0xffffffe66cffed00 ob` ——**被静默截断**。逐层查出是缓冲区太小：`remotepage.m` 的 `gMessage`(256) / `gFirstFailDetail`(192)、`unitypatch.m` 的 `gMessage`(256) / `why`(192) / `detail`(192)、以及**真正的截断点** `PolarisBridge.mm` 的 `char message[256]`（×3）——`remotepage` 拼好的长信息在 C→OC 边界又被砍回 256 字节。全部统一扩到 1024。同时：**① 新增 `gTierTrace` 逐档留痕**，每档记 `#n off/sz/prot -> err`，失败时整条打出（此前只看得到末档，第 1 档 `prot=ALL\|IS_MASK` 报什么错完全不可见）；**② `gEntryTrace` 补上原始输入** `eStart`/`vmeOffraw`，使 `entryOffset = (vmAddress - entryStart) + (vmeOffraw << 12)` 可现场验算；**③ `vme_offset` 非 0 时主动告警**。数值核对：`target-base = 0x9e3f824` ✅ 正确；`obj=0xffffffe66cffed00` ✅ 落在 `[VM_MIN,VM_MAX]` 内且 64 字节对齐（**排除「压缩指针解包错误」**）；`namedEntrySize=0x8000000`(128MB) 与 `roundedsize=0x16584000`(357MB) 不符 ⚠️ 待查 |
+| 0.4.7 | **修复 `(os/kern) invalid right(0x11)`，并修正 v0.4.6 阶梯的两处缺陷**。真机 v0.4.6 日志把错误码从 `KERN_INVALID_ARGUMENT(4)` 推进到 `KERN_INVALID_RIGHT(17)`——**offset/size 那层已经通过**，说明 v0.4.6 的阶梯方向对了。剩下的拒绝点是 `vm_map.c:4184/4189` 的权限子集校验：entry 是 `R\|W`(`0x3`)，map 请求 `VM_PROT_ALL`(`0x7`)，`(0x3 & 0x7) != 0x7` → 拒。**① 恢复 `VM_PROT_IS_MASK`(`0x40`) 作为首选 prot 候选**：v0.4.5 以「语义用错」为由移除它是**错的**，它其实是 XNU 的权限收敛机制（置位后内核先做 `cur_protection &= named_entry->protection`，把 `0x7` 收缩成 `0x3`），不影响「映射后能否读写」，只影响「请求权限怎么收敛」。**② `mach_make_memory_entry_64` 的 protection 提到 `VM_PROT_ALL`**（失败退回 `READ\|WRITE`），让「请求权限 ⊆ entry 权限」恒成立。**③ 阶梯从一维改为二维笛卡尔积** {`entryOffset`, `entryOffset-objectOffset`} × {`ALL\|IS_MASK`, `ALL`, `RW`}：v0.4.6 所有 offset 候选的生成条件都写死 `mapOffset != 0`，而真机这次 `entryOffset == 0`，于是只剩 1 档，正好对应日志里的「全部 1 档均失败」。**④** 失败信息末尾无条件追加 `gEntryTrace`（`obj/objsz/entryOff/objOff`），避免这四个关键数被后续 `pr_set_message` 覆盖。**`VM_PROT_IS_MASK` 假设经第三轮真机未能证实（4 档全败）** |
 | 0.4.6 | **用「阶梯重试」取代对 `mach_vm_map` 单次调用**：v0.4.5 加的 `named_entry->size` 校验经真机数据回算后**未被触发**（`0x16584000` = 357MB ≥ 需要的 `0x9e40000` = 158MB），说明拒绝点不在尺寸上。把 `KERN_INVALID_ARGUMENT(4)` 逐条对回 `vm_map.c` 的所有分支后，剩下的候选（`named_entry->offset` 非 0 导致 `obj_offs` 二次累加；或 `named_entry->size` 真实值更小）静态无法区分，于是改为按优先级逐个尝试 offset/size/prot 组合，失败档位零副作用。新增 `polaris_vmshmem_t.exact` 安全闸门：**读路径**允许不精确映射（Mach-O magic 自校验兜底），**写路径强制要求精确**，避免退化的 `offset=0` 映射把 4 字节写到游戏对象的错误页上。**遗留缺陷（v0.4.7 修）：阶梯写成一维且条件写死 `mapOffset != 0`，`entryOffset == 0` 时只剩 1 档** |
 | 0.4.5 | **定位「(os/kern) invalid argument」的怀疑点**：v0.4.4 已证明 offset(`0x9e3c000`) 与 size(`0x4000`) 都 16KB 对齐、且远在 vm_object 之内，故「不对齐/越界」两个假设被数据否掉。错误码是 `KERN_INVALID_ARGUMENT(4)` 而非 `KERN_INVALID_ADDRESS(1)`，据此怀疑 XNU `vm_map.c` 的 `if (named_entry->size < obj_offs + initial_size)` 守卫。本次：① 回读 `mach_make_memory_entry_64` 的 in/out `entrysize`；② 直接读内核里 `vm_named_entry->size`（+0x20）作为权威上限；③ 映射前显式校验并给出可读原因；④ 去掉 `VM_PROT_IS_MASK`；⑤ 失败日志追加 `prot`。**事后回算证明该守卫未触发，本版假设不成立**；且第 ④ 点移除 `VM_PROT_IS_MASK` 本身也是错的（v0.4.7 已恢复并说明原因） |
 | 0.4.4 | **修复「目标地址读不到内容」（41ms 秒退）**：`mach_vm_map` 的 `size` 取编译期 `PAGE_SIZE`(16KB)、`offset` 取按运行时 `pr_page_size()` 算出的 `entryOffset`，两个页大小来源不一致；当 `host_page_size()` 返回 4096 时 `offset % size != 0`，内核以 `KERN_INVALID_ADDRESS` 拒绝。改为统一用 `PR_MAP_PAGE_SIZE`(16KB)，`pr_detect_page_size()` 不再接受 4KB，并新增 `entryOffset` 的 16KB 对齐校验（不对齐直接报错，不硬凑 offset）。同时把映射失败的**真实内核返回码**透出到日志，取代原先误导性的「映像可能未加载」 |

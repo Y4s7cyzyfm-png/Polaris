@@ -8,7 +8,7 @@ workflows:
       xcode: latest
       vars:
         BUNDLE_ID: com.polaris.toolkit
-        APP_VERSION: 0.4.7
+        APP_VERSION: 0.4.8
     triggering:
       events:
         - push
@@ -29,7 +29,7 @@ workflows:
             ONLY_ACTIVE_ARCH=YES \
             VALID_ARCHS=arm64e \
             MARKETING_VERSION=${APP_VERSION} \
-            CURRENT_PROJECT_VERSION=${BUILD_NUMBER:-11} \
+            CURRENT_PROJECT_VERSION=${BUILD_NUMBER:-12} \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
