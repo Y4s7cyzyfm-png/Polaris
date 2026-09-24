@@ -582,7 +582,8 @@ uint64_t polaris_find_unity_framework_base(void) {
         uint64_t bad = gUnityBase;
         gUnityBase = 0;
         gTargetAddr = 0;
-        up_set_message("定位到的基址越界（0x%llx），已放弃以免写错内存", bad);
+        up_set_message("定位到的基址越界（0x%llx），已放弃以免写错内存",
+                       (unsigned long long)bad);
         return 0;
     }
 
@@ -593,7 +594,8 @@ uint64_t polaris_find_unity_framework_base(void) {
         uint64_t bad = gTargetAddr;
         gTargetAddr = 0;
         gUnityBase = 0;
-        up_set_message("内透目标地址越界（0x%llx），已放弃以免写错内存", bad);
+        up_set_message("内透目标地址越界（0x%llx），已放弃以免写错内存",
+                       (unsigned long long)bad);
         return 0;
     }
 
@@ -626,7 +628,7 @@ bool polaris_enable_transparent_wall(void) {
     }
     // 目标地址是 smoba 的用户态地址，必须走用户态窗口校验
     if (!up_is_user_pointer(gTargetAddr)) {
-        up_set_message("内透目标地址无效（0x%llx）", gTargetAddr);
+        up_set_message("内透目标地址无效（0x%llx）", (unsigned long long)gTargetAddr);
         return false;
     }
 
@@ -694,7 +696,7 @@ bool polaris_enable_transparent_wall(void) {
 
     gEnabled = true;
     up_set_message("内透已开启 · 0x%llx（原值 0x%08X → 0x%08X）",
-                   gTargetAddr, gOriginalInstruction, UNITY_PATCH_VALUE);
+                   (unsigned long long)gTargetAddr, gOriginalInstruction, UNITY_PATCH_VALUE);
     return true;
 }
 

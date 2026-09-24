@@ -53,6 +53,16 @@ typedef struct {
     uint64_t remoteAddress; ///< 目标进程里的虚拟地址（页首）
     uint64_t localAddress;  ///< 映射进本进程后的地址（页首）
     bool     used;          ///< 映射是否成功
+
+    /// ★ 安全闸门：映射是否**精确**指向 remoteAddress 那一页。
+    ///
+    /// 建立映射时内核可能拒绝某些 offset 组合，代码会退到备用 offset
+    /// （例如 offset=0）。那种情况下映射能用，但 `localAddress` 对应的
+    /// 是对象起始处，**不是** remoteAddress 指向的页。
+    ///
+    /// 读路径：有内容校验（如 Mach-O magic）时可接受不精确映射；
+    /// 写路径：**必须** exact==true，否则会把数据写到错误的页上。
+    bool     exact;
 } polaris_vmshmem_t;
 
 // ---------------------------------------------------------------------------

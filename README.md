@@ -36,7 +36,30 @@ value  = 0xD2800021                           // arm64: mov w1, #1
 |---|---|---|
 | 运行位置 | 游戏进程内 | 独立 App |
 | 基址来源 | `dyld_get_image_vmaddr_slide()` | 内核遍历 smoba 的 `vm_map` 条目 |
-| 写内存 | `vm_protect` + `vm_write`（本进程） | `ds_kwrite32()`（内核原语，无需改页权限） |
+| 写内存 | `vm_protect` + `vm_write`（本进程） | `polaris_remote_write()`（vm_object 共享映射） |
+| 能否直接调 il2cpp | ✅ 可以（同进程） | ❌ 不行（见下） |
+
+### 为什么 dylib 那套不能照搬（也不能"不需要 UnityFramework"）
+
+常有人问：「dylib 插件是不是根本不需要 UnityFramework？」
+**不是。** 两者都需要它，只是「怎么拿到基址」不同：
+
+| 环节 | dylib 插件 | Polaris |
+|---|---|---|
+| 拿基址 | `_dyld_get_image_vmaddr_slide(i)` —— **同进程** dyld API，注入后与 smoba 共享地址空间，遍历 `_dyld_image_count()` 即可 | 内核侧遍历 smoba 的 `vm_map` 条目 + Mach-O 头校验 |
+| 调 il2cpp | `dlopen("Frameworks/UnityFramework.framework/UnityFramework")` 后 `dlsym` 拿 `il2cpp_*` 符号，在**游戏进程内**执行 | **做不到** —— `il2cpp_class_get_method_from_name()` 必须在游戏进程里跑，跨进程无法调用 |
+
+所以 `Il2CppAttach(@"Frameworks/UnityFramework.framework/UnityFramework")`
+这一步是 **必须的**：它不是为了找基址，而是为了 `dlopen` Unity 的二进制、
+再 `dlsym` 出 `il2cpp_*` 函数指针。插件只是省掉了「手动算基址」。
+
+> 顺带印证：插件里 `getMethod()` 最后算的是
+> `rvaOffset = method_abs - image_base` —— 说明**只有 RVA 是跨进程可搬运的量**。
+> 这正好独立验证了本项目用 `UnityFrameworkBase + 0x09E3F824` 的做法。
+
+**结论**：`0x09E3F824` 是 UnityFramework 的 RVA，拿到它就够了；
+il2cpp 那套运行时解析对我们没用，因为我们没法在 smoba 里执行代码 ——
+只能老老实实定位基址、然后**直接改 `__TEXT` 字节**。
 
 **基址定位**（`Vendor/unitypatch.m`）：
 
@@ -203,6 +226,63 @@ else if (ps >= 4096)  gPageShift = 12;   // ← 一旦命中，page 按 4KB 对�
 > 曾尝试「把 offset 下取整到 16KB，再用 delta 补偿页内偏移」，
 > 仿真发现 delta 较大时本地窗口会整体前移、反而覆盖不到目标地址，故弃用。
 
+### `offset` 语义歧义与阶梯重试（v0.4.6）
+
+v0.4.4 真机日志（`0x4` = `KERN_INVALID_ARGUMENT`）：
+
+```
+读目标地址 0x121fc3824 失败（基址 0x118184000）
+· mach_vm_map 失败：(os/kern) invalid argument(0x4)
+  off=0x9e3c000 size=0x4000 objsize=0x16584000
+```
+
+把 `off/size/objsize` 三个数代回去算，可以**确定性地否掉两个假设**：
+
+| 假设 | 推算 | 结论 |
+|---|---|---|
+| offset 未按 16KB 对齐 | `0x9e3c000 % 0x4000 == 0` | ✗ 否掉（且错误码会是 `KERN_INVALID_ADDRESS(1)`） |
+| offset 越出 vm_object | `0x9e3c000 + 0x4000 < 0x16584000` | ✗ 否掉 |
+
+再把 `KERN_INVALID_ARGUMENT(4)` 逐条对回 `vm_map.c` 里所有返回该码的分支：
+
+| 分支 | 判定 |
+|---|---|
+| `vm_sanitize_cur_and_max_prots` | 传 `VM_PROT_ALL`，合法 → 不是 |
+| `vm_sanitize_inherit` | `VM_INHERIT_NONE`，合法 → 不是 |
+| `vm_sanitize_mask(0)` | `0` 合法 → 不是 |
+| `vm_sanitize_addr_size(offset)` | 该调用点带 `GET_UNALIGNED_VALUES`，不做对齐检查 → 不是 |
+| `named_entry->size < obj_offs + initial_size` | `0x16584000`(357MB) ≥ `0x9e40000`(158MB) → **通过** |
+
+剩下两类静态分析无法区分：
+
+1. `named_entry->offset != 0` —— 同一分支稍后会把 `obj_offs` **再累加**一次
+   `named_entry->offset`，存在「守卫通过、随后越界被拒」的窗口；
+2. `named_entry->size` 的真实值小于 `0x9e40000`（内核偏移 `0x20` 离线不可证）。
+
+**修法：不再赌是哪一类，改成阶梯重试。**
+
+`pr_create_shmem_with_obj()` 现在按优先级逐个尝试 offset / size / prot 组合：
+
+| 档 | offset | size | prot | 精确 |
+|---|---|---|---|---|
+| 1 | `entryOffset` | 16KB | `VM_PROT_ALL` | ✅ |
+| 2 | `entryOffset - objectOffset` | 16KB | `VM_PROT_ALL` | ✅ |
+| 3 | 同档 2 | 16KB | `ALL \| IS_MASK`（Rein 原版写法） | ✅ |
+| 4 | `0`（仅当 `entryOffset == 0`） | 16KB | `VM_PROT_ALL` | ✅ |
+| 5 | `0` | `namedEntrySize` | `VM_PROT_ALL` | ❌ |
+
+失败档位在内核里**不留残留映射**，重试是零副作用的；哪一档成功会写进日志。
+
+#### 安全闸门：`exact`
+
+第 5 档虽然能让映射成功，但它指向的是**对象起始处**而非目标页。
+`polaris_vmshmem_t` 因此新增 `exact` 字段，并贯穿页缓存：
+
+- **读路径**允许不精确映射 —— 调用方（Mach-O 探测）自带 magic 校验，读到错页会被挡掉，是「安全失败」；
+- **写路径强制要求 `exact == true`** —— 否则拒绝写入并报错。
+  因为映射是共享的，写错页等于**真的改到游戏进程的对象第 0 页**，
+  比直接失败严重得多。
+
 ### 读取路径的分层
 
 修复后 `unitypatch.m` 的读取分成明确两层：
@@ -270,7 +350,7 @@ open Polaris.xcodeproj   # Xcode 16+ 打开，⌘R 运行（真机 arm64e）
 |---|---|---|
 | `Polaris/SettingsView.swift` | `telegramURL` | `https://t.me/polaris_channel` |
 | `Polaris.xcodeproj/project.pbxproj` | `PRODUCT_BUNDLE_IDENTIFIER`（Debug/Release 两处） | `com.polaris.toolkit` |
-| `codemagic.yaml` | `BUNDLE_ID` / `APP_VERSION` | `com.polaris.toolkit` / `0.4.5` |
+| `codemagic.yaml` | `BUNDLE_ID` / `APP_VERSION` | `com.polaris.toolkit` / `0.4.6` |
 
 > CI 里 `MARKETING_VERSION` 现在取 `${APP_VERSION}`（此前被硬编码成 `0.2.0`，
 > 会导致 pbxproj 里的版本号在 CI 构建时被覆盖——崩溃日志里 `app_version: 0.2.0`
@@ -314,7 +394,8 @@ Polaris/
 
 | 版本 | 变更 |
 |---|---|
-| 0.4.5 | **定位「(os/kern) invalid argument」的真因**：v0.4.4 已证明 offset(0x9e3c000) 与 size(0x4000) 都 16KB 对齐、且远在 vm_object 之内，故「不对齐/越界」两个假设被数据否掉。错误码是 `KERN_INVALID_ARGUMENT(4)` 而非 `KERN_INVALID_ADDRESS(1)`，对应 XNU `vm_map.c:4155` 的 `if (named_entry->size < obj_offs + initial_size)`。本次：① 回读 `mach_make_memory_entry_64` 的 in/out `entrysize`；② 直接读内核里 `vm_named_entry->size`（+0x20）作为权威上限；③ 映射前显式校验并给出可读原因；④ 去掉 `VM_PROT_IS_MASK`（查证后确认它不导致该错误码，但语义确实用错）；⑤ 失败日志追加 `prot` |
+| 0.4.6 | **用「阶梯重试」取代对 `mach_vm_map` 单次调用**：v0.4.5 加的 `named_entry->size` 校验经真机数据回算后**未被触发**（`0x16584000` = 357MB ≥ 需要的 `0x9e40000` = 158MB），说明拒绝点不在尺寸上。把 `KERN_INVALID_ARGUMENT(4)` 逐条对回 `vm_map.c` 的所有分支后，剩下的候选（`named_entry->offset` 非 0 导致 `obj_offs` 二次累加；或 `named_entry->size` 真实值更小）静态无法区分，于是改为按优先级逐个尝试 offset/size/prot 组合，失败档位零副作用。新增 `polaris_vmshmem_t.exact` 安全闸门：**读路径**允许不精确映射（Mach-O magic 自校验兜底），**写路径强制要求精确**，避免退化的 `offset=0` 映射把 4 字节写到游戏对象的错误页上 |
+| 0.4.5 | **定位「(os/kern) invalid argument」的怀疑点**：v0.4.4 已证明 offset(`0x9e3c000`) 与 size(`0x4000`) 都 16KB 对齐、且远在 vm_object 之内，故「不对齐/越界」两个假设被数据否掉。错误码是 `KERN_INVALID_ARGUMENT(4)` 而非 `KERN_INVALID_ADDRESS(1)`，据此怀疑 XNU `vm_map.c` 的 `if (named_entry->size < obj_offs + initial_size)` 守卫。本次：① 回读 `mach_make_memory_entry_64` 的 in/out `entrysize`；② 直接读内核里 `vm_named_entry->size`（+0x20）作为权威上限；③ 映射前显式校验并给出可读原因；④ 去掉 `VM_PROT_IS_MASK`（查证后确认它不导致该错误码，但语义确实用错）；⑤ 失败日志追加 `prot`。**事后回算证明该守卫未触发，本版假设不成立** |
 | 0.4.4 | **修复「目标地址读不到内容」（41ms 秒退）**：`mach_vm_map` 的 `size` 取编译期 `PAGE_SIZE`(16KB)、`offset` 取按运行时 `pr_page_size()` 算出的 `entryOffset`，两个页大小来源不一致；当 `host_page_size()` 返回 4096 时 `offset % size != 0`，内核以 `KERN_INVALID_ADDRESS` 拒绝。改为统一用 `PR_MAP_PAGE_SIZE`(16KB)，`pr_detect_page_size()` 不再接受 4KB，并新增 `entryOffset` 的 16KB 对齐校验（不对齐直接报错，不硬凑 offset）。同时把映射失败的**真实内核返回码**透出到日志，取代原先误导性的「映像可能未加载」 |
 | 0.4.3 | **修复「未找到 UnityFramework 映像」（36ms 秒退）**：根因是 `ds_kread*`/`ds_kwrite*` 只认内核地址，而 UnityFramework 基址与内透目标都是 smoba 用户态地址，被 `ds_isvalid` 全数拒掉。新增 `remotepage.{h,m}` 跨进程访问层——移植 Rein `TaskRop/vm.m` 的 **vm_object 共享映射**（vtop 在 iOS 18.6 上语义不符，已排除），把目标页映射进本进程后用 `memcpy` 读写；读取路径按目标分成 `up_safe_kread*`（内核对象）/ `up_user_read*`（smoba 用户态）两层；内透写入改走 `up_user_write()` 而非 `ds_kwrite32`；定位前先 `polaris_remote_set_target(vmMap)` 登记目标进程，开启/关闭路径带自愈重登记 |
 | 0.4.2 | **修复内透定位到错误基址**：去掉「校验失败时退回体积最大条目」的危险兜底（smoba 有个 ~9.8GB 匿名映射，体积碾压 UnityFramework 的 280MB，导致基址错到 `0x274000000`）；阶段 1 增加页对齐筛选，候选上限提到 64 且不再按体积裁剪；排序改为「特征区间 → 合理库大小（≤2GB）→ 体积降序」；新增基址/目标地址的最终窗口闸门，越界即放弃 |

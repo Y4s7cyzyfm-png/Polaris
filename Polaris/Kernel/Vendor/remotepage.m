@@ -155,6 +155,10 @@ static uint64_t gRemoteVmMap = 0;     ///< 目标进程（smoba）的 vm_map
 static uint32_t gPageShift  = 0;      ///< 页大小 shift（iOS 16KB → 14）
 static char     gMessage[256] = {0};
 
+/// 最近一次成功映射用的档位标签（写进 describe 输出）。
+/// 这一项直接回答「阶梯第几档生效」——是排查 offset 语义的关键证据。
+static char gLastGoodLabel[96] = {0};
+
 static void pr_set_message(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void pr_set_message(const char *fmt, ...) {
     va_list ap;
@@ -544,33 +548,71 @@ static polaris_vmshmem_t pr_create_shmem_with_obj(struct pr_vmobj *object) {
 
     mach_vm_address_t mappedaddr = 0;
 
-    // ★ 关键前置校验：offset 必须落在 named entry 的范围之内。
+    // ★ 前置记录（不再拦截）：offset 是否落在 named entry 范围内。
     //
-    // XNU vm_map.c:4155（mach_vm_map 处理 IKOT_NAMED_ENTRY 的分支）有：
+    // XNU vm_map.c 的 IKOT_NAMED_ENTRY 分支有：
     //     if (named_entry->size < obj_offs + initial_size) {
     //         return KERN_INVALID_ARGUMENT;
     //     }
-    // 只要 mapOffset + mapPageSize 超出去，就会原样返回 KERN_INVALID_ARGUMENT(4)
-    // —— 正是真机日志里的错误码。
+    // 我们按真机数据算过：obj_offs(0x9e3c000) + size(0x4000) = 0x9e40000 (158MB)
+    // 远小于 objsize(0x16584000 = 357MB)，所以这条**不是**拒绝原因。
     //
-    // 优先用从内核直接读出的 named_entry->size（它就是内核要比对的那个值）；
-    // 读不到时退回 mach_make_memory_entry_64 回读的 entrysize。
+    // 这里只把数值写进日志（留在 gMessage 里供 describe 展示），不做 return ——
+    // 因为下面的重试阶梯已经能覆盖「entry 比预期小」的情形（候选 3/4/6
+    // 都用 offset=0，天然合法），没必要提前把路堵死。
+    //
+    // 权威上限优先取内核里 vm_named_entry->size；读不到时退回
+    // mach_make_memory_entry_64 回读的 entrysize。
     uint64_t limitSize = okNEs ? namedEntrySize : (uint64_t)realEntrySize;
     if (limitSize != 0 && limitSize < mapOffset + mapPageSize) {
-        pr_set_message("映射请求超出 memory entry 范围："
-                       "namedEntrySize=0x%llx entrySize=0x%llx "
-                       "需要 0x%llx（off=0x%llx + size=0x%llx）· vmobjSize=0x%llx",
-                       (unsigned long long)(okNEs ? namedEntrySize : 0),
-                       (unsigned long long)realEntrySize,
+        pr_set_message("提示：off+size=0x%llx 超出 entry 尺寸 0x%llx"
+                       "（namedEntrySize=0x%llx entrySize=0x%llx），"
+                       "将改用 offset=0 的候选",
                        (unsigned long long)(mapOffset + mapPageSize),
-                       (unsigned long long)mapOffset,
-                       (unsigned long long)mapPageSize,
-                       (unsigned long long)roundedsize);
-        mach_vm_deallocate(mach_task_self_, localaddr, roundedsize);
-        return shmem;
+                       (unsigned long long)limitSize,
+                       (unsigned long long)(okNEs ? namedEntrySize : 0),
+                       (unsigned long long)realEntrySize);
     }
 
-    // 注意：**不要**给 mach_vm_map 的 protection 参数加 VM_PROT_IS_MASK。
+    // 8) 建立映射 —— 用「阶梯重试」而不是单次调用
+    //
+    // ── 为什么需要阶梯 ─────────────────────────────────────────────────
+    //
+    // 真机 v0.4.4 日志：
+    //     mach_vm_map 失败：(os/kern) invalid argument(0x4)
+    //     off=0x9e3c000 size=0x4000 objsize=0x16584000
+    //
+    // 把这个错误码逐条对回 XNU vm_map.c 里所有 return KERN_INVALID_ARGUMENT
+    // 的分支后，可以确定性地排除掉大部分：
+    //
+    //   · vm_sanitize_cur_and_max_prots  —— 传 VM_PROT_ALL，合法
+    //   · vm_sanitize_inherit            —— VM_INHERIT_NONE，合法
+    //   · vm_sanitize_mask(0)            —— 0 合法
+    //   · vm_sanitize_addr_size(offset)  —— 该调用点带
+    //       VM_SANITIZE_FLAGS_GET_UNALIGNED_VALUES，**不做**对齐检查
+    //   · named_entry->size < obj_offs + initial_size
+    //                                    —— 0x16584000(357MB) >=
+    //                                       0x9e40000(158MB)，通过
+    //
+    // 剩下的、静态分析无法再区分的只有两类：
+    //
+    //   (i)  named_entry->offset != 0
+    //        同一分支稍后有：
+    //            if (named_entry->offset) {
+    //                vm_map_enter_adjust_offset(&obj_offs, &obj_end,
+    //                                           named_entry->offset);  // 累加
+    //            }
+    //        即 obj_offs 会在守卫**之后**再被加上 named_entry->offset。
+    //        若它非 0，就存在「守卫通过、但随后越界/溢出被 (4) 拒」的窗口。
+    //
+    //   (ii) named_entry->size 的真实值小于 0x9e40000（离线读偏移不可证）。
+    //
+    // 与其继续赌是哪一类，不如把候选组合都试一遍：
+    // 每一次失败都是零副作用的（内核拒了不会留下半成品映射），
+    // 成功的组合会被 gLastGood 记住，后续同进程直接复用。
+    // 这样无论真因是 (i) 还是 (ii)，都能自行收敛。
+    //
+    // ── 关于 VM_PROT_IS_MASK ──────────────────────────────────────────
     //
     // XNU osfmk/mach/vm_prot.h：
     //     /* Another invalid protection value.
@@ -578,29 +620,172 @@ static polaris_vmshmem_t pr_create_shmem_with_obj(struct pr_vmobj *object) {
     //        mask against the actual protection bits of the map entry. */
     //     #define VM_PROT_IS_MASK  ((vm_prot_t) 0x40)
     //
-    // 查过源码后确认：它**不会**导致 KERN_INVALID_ARGUMENT
-    // （vm_sanitize.c:639 的 allowed 掩码里，vm_map.c:4002 恰好把
-    //  VM_PROT_IS_MASK 作为 extra_mask 传了进去，所以能过校验）。
-    // 但语义仍是错的：置位后 vm_map.c:4141 会走
-    //     mask_cur_protection = cur_protection & VM_PROT_IS_MASK;
-    //     cur_protection &= named_entry->protection;   // 变成"取交集"
-    // 我们要的是绝对权限，所以这里如实传 VM_PROT_ALL。
-    vm_prot_t curprot = VM_PROT_ALL;
-    vm_prot_t maxprot = VM_PROT_ALL;
+    // 它**不会**导致 KERN_INVALID_ARGUMENT —— vm_map.c 调
+    // vm_sanitize_cur_and_max_prots 时把 VM_PROT_IS_MASK 作为 extra_mask
+    // 传了进去（vm_sanitize.c 的 allowed 掩码因此包含它），0x47 & ~0x47 == 0。
+    // 但语义是错的：置位后 cur_protection 会与 named_entry->protection 取交集。
+    // Rein 原版正是这么传的（vm.m:196-197），下面作为候选一并保留，
+    // 但**首选**是语义正确的 VM_PROT_ALL。
+    //
+    // ⚠️ 注意 VM_PROT_IS_MASK 的**权威值**是 0x40，不是 0x80000000。
+    //    SDK 的 <mach/vm_prot.h> 若给出别的高位值，说明是占位/过期定义，
+    //    本文件因此直接硬编码 0x40，不依赖该头文件。
+#define PR_VM_PROT_IS_MASK ((vm_prot_t)0x40)
 
-    ret = mach_vm_map(mach_task_self_, &mappedaddr, mapPageSize, 0, VM_FLAGS_ANYWHERE,
-                      memobj, (memory_object_offset_t)mapOffset,
-                      false /* copy = FALSE */, curprot, maxprot, VM_INHERIT_NONE);
-    if (ret != KERN_SUCCESS) {
-        // ★ 这是最关键的诊断点：把内核返回码、以及参与映射的三个数值全报出来，
-        // 这样真机日志能直接判定是「偏移越界」「权限不足」还是「memobj 无效」。
-        pr_set_message("mach_vm_map 失败：%s(0x%x) off=0x%llx size=0x%llx objsize=0x%llx prot=0x%x",
-                       mach_error_string(ret), (unsigned)ret,
-                       (unsigned long long)mapOffset,
-                       (unsigned long long)mapPageSize,
+    /// 一次映射尝试的全部输入
+    typedef struct {
+        uint64_t    offset;   ///< memobj 内偏移（字节）
+        uint64_t    size;     ///< 映射长度
+        vm_prot_t   prot;     ///< cur/max protection
+        bool        exact;    ///< true = 语义上精确指向目标页（可安全用于写入）
+        const char *label;    ///< 日志用
+    } pr_maptry_t;
+
+    // ── 构造候选阶梯 ─────────────────────────────────────────────────
+    //
+    // ★ 安全前提：**只有 exact == true 的候选才允许被写路径使用**。
+    //
+    // 为什么这么严格：mach_vm_map 建立的是共享映射，写它会真的改到
+    // 目标 vm_object。若某候选把「对象第 0 页」映射进来，写入就会
+    // 落到游戏进程对象的第 0 页 —— 那是静默改错内存，比直接失败严重得多。
+    // 因此 offset=0 这类候选一律标 exact=false，并在取用时由调用层判断。
+    //
+    // 候选顺序（优先级从高到低）：
+    //   1. offset = entryOffset            —— 与 Rein 完全一致的原始语义
+    //   2. offset = entryOffset - objectOffset
+    //                                      —— 「相对对象起点」的净偏移
+    //   3. 候选 2 + VM_PROT_IS_MASK        —— Rein 的权限写法
+    //   4. offset = 0（仅当 entryOffset < 一页时 exact）
+    //   5. offset = 0 + 映射整块 entry     —— 最后手段，exact=false
+    pr_maptry_t tries[8];
+    int ntries = 0;
+
+    // ── 候选 1：原样传 entryOffset（Rein 行为）─────────────────────
+    tries[ntries++] = (pr_maptry_t){ mapOffset, mapPageSize, VM_PROT_ALL,
+                                     true, "off=entryOff prot=RWX" };
+
+    // ── 候选 2：减去 objectOffset，得到「相对对象起点」的净偏移 ────
+    //
+    // 推导：entryOffset = (page - entry.start) + objectOffset
+    //   若内核把 mach_vm_map 的 offset 解释成「相对**对象**起点」，
+    //   那么该传的就是 (page - entry.start) = entryOffset - objectOffset。
+    //
+    // ★ 真机数据正好落在这个情形上：
+    //     日志 off(entryOffset) = 0x9e3c000，而 objectOffset = vme_offset << 12。
+    //     若 vme_offset == 0 ⇒ objectOffset == 0 ⇒ 候选 1 与候选 2 相同（会被去重）；
+    //     若 vme_offset != 0 ⇒ 减完得到 (page - entry.start)，
+    //     而它必然 16KB 对齐（page 与 entry.start 都页对齐），因此是精确映射。
+    if (object->objectOffset != 0 && mapOffset >= object->objectOffset) {
+        uint64_t netOff = mapOffset - object->objectOffset;
+        // 去重：与候选 1 相同则跳过
+        if (netOff != mapOffset && (netOff & (PR_MAP_PAGE_SIZE - 1)) == 0) {
+            tries[ntries++] = (pr_maptry_t){ netOff, mapPageSize, VM_PROT_ALL,
+                                             true, "off=entryOff-objectOff prot=RWX" };
+        }
+    }
+
+    // ── 候选 3：候选 2 的权限变体（Rein 原版带 VM_PROT_IS_MASK）────
+    if (ntries >= 2) {
+        tries[ntries] = tries[1];
+        tries[ntries].prot  = (vm_prot_t)(VM_PROT_ALL | PR_VM_PROT_IS_MASK);
+        tries[ntries].label = "off=entryOff-objectOff prot=ALL|IS_MASK";
+        ntries++;
+    }
+
+    // ── 候选 4：objectOffset == 0 时，退化为「对象相对偏移」= entryOffset ──
+    //
+    // 如果 vme_offset == 0（objectOffset == 0），候选 2 会被去重掉，
+    // 此时上面已没有能表达「对象相对偏移」的档位。
+    // 而 objectOffset == 0 时，entryOffset 本身就等于 (page - entry.start)，
+    // 也就是对象相对偏移 —— 与候选 1 同值，无需再加。
+    //
+    // 反过来，当 objectOffset != 0 且候选 2 因对齐被跳过时，
+    // 这里补一个 offset=0 的精确候选：它对应「对象起点那一页」，
+    // 只有在 entryOffset == objectOffset（即 page == entry.start）时才精确。
+    if (mapOffset == object->objectOffset && mapOffset != 0) {
+        // 目标页恰好是 entry 的首页 ⇒ offset=0 指向的就是目标页
+        tries[ntries++] = (pr_maptry_t){ 0, mapPageSize, VM_PROT_ALL,
+                                         true, "off=0(entry 首页) prot=RWX" };
+    }
+
+    // ── 候选 5：整块 entry，offset=0（最后手段，不精确）────────────
+    //
+    // 这一档刻意排在最后，且 exact=false：
+    // 它能让映射成功（绕开所有 offset 相关校验），
+    // 但映射到的是对象起始处，不是目标页。
+    // 只有「读 Mach-O 头」这类自带 magic 校验的调用方才敢用。
+    if (mapOffset != 0 && okNEs && namedEntrySize != 0) {
+        uint64_t whole = namedEntrySize;
+        if ((whole & (PR_MAP_PAGE_SIZE - 1)) == 0 && whole >= mapPageSize) {
+            tries[ntries++] = (pr_maptry_t){ 0, whole, VM_PROT_ALL,
+                                             false, "off=0 size=namedEntrySize(不精确)" };
+        }
+    }
+
+    kern_return_t lastRet = KERN_SUCCESS;
+    uint64_t     lastOffset = 0;
+    uint64_t     lastSize   = 0;
+    vm_prot_t    lastProt   = 0;
+    const char  *lastLabel  = "";
+
+    // 命中的候选是否「精确指向目标页」。写路径必须检查这个标志：
+    // 不精确的映射虽然可用，但写入会落到对象起始处而非目标页。
+    bool hitExact = false;
+
+    for (int i = 0; i < ntries; i++) {
+        pr_maptry_t t = tries[i];
+
+        // 该候选的 size 不能为 0，否则内核必然拒
+        if (t.size == 0) continue;
+        // size 必须是页对齐的，否则 vm_sanitize_size 会失败
+        if (t.size & (PR_MAP_PAGE_SIZE - 1)) continue;
+        // offset 必须是页对齐的（mach_vm_map 的硬要求）
+        if (t.offset & (PR_MAP_PAGE_SIZE - 1)) continue;
+
+        mach_vm_address_t addr = 0;
+        ret = mach_vm_map(mach_task_self_, &addr, t.size, 0, VM_FLAGS_ANYWHERE,
+                          memobj, (memory_object_offset_t)t.offset,
+                          false /* copy = FALSE */, t.prot, t.prot, VM_INHERIT_NONE);
+
+        lastRet    = ret;
+        lastOffset = t.offset;
+        lastSize   = t.size;
+        lastProt   = t.prot;
+        lastLabel  = t.label;
+
+        if (ret == KERN_SUCCESS) {
+            mappedaddr = addr;
+            hitExact   = t.exact;
+            snprintf(gLastGoodLabel, sizeof(gLastGoodLabel), "%s（第 %d/%d 档）",
+                     t.label, i + 1, ntries);
+            pr_set_message("映射成功 · %s · off=0x%llx size=0x%llx prot=0x%x"
+                           "（第 %d/%d 档）",
+                           t.label,
+                           (unsigned long long)t.offset,
+                           (unsigned long long)t.size,
+                           (unsigned)t.prot,
+                           i + 1, ntries);
+            break;
+        }
+
+        // KERN_INVALID_ADDRESS(1) / KERN_INVALID_RIGHT(2) / (4) 等都继续试下一档；
+        // 这些失败不会在内核里留下残留映射，重试是安全的。
+    }
+
+    // 把「是否精确」写进 shmem，供上层决定能不能用于写入。
+    // 这一位是安全闸门：不精确的映射只允许读，绝不允许写。
+    shmem.exact = hitExact;
+
+    if (mappedaddr == 0) {
+        // 全部候选都失败：把最后一档的完整现场报出来（含每一档都没成功这一事实）
+        pr_set_message("mach_vm_map 全部 %d 档均失败。末档 %s：%s(0x%x) "
+                       "off=0x%llx size=0x%llx objsize=0x%llx prot=0x%x",
+                       ntries, lastLabel,
+                       mach_error_string(lastRet), (unsigned)lastRet,
+                       (unsigned long long)lastOffset,
+                       (unsigned long long)lastSize,
                        (unsigned long long)roundedsize,
-                       (unsigned)curprot);
-        mappedaddr = 0;
+                       (unsigned)lastProt);
     }
 
     // 8) 释放临时载体（映射已独立存在）
@@ -644,6 +829,7 @@ void polaris_vm_unmap_local(uint64_t localAddress, uint64_t size) {
 typedef struct {
     uint64_t remotePage;
     uint64_t localPage;
+    bool     exact;      ///< 该页的映射是否精确（决定能否用于写入）
 } pr_page_slot_t;
 
 static pr_page_slot_t gPageCache[PR_PAGE_CACHE_CAP];
@@ -684,7 +870,23 @@ static uint64_t pr_page_cache_get(uint64_t remotePage) {
     return 0;
 }
 
-static void pr_page_cache_put(uint64_t remotePage, uint64_t localPage) {
+/// 查缓存里这一页的映射是否精确（能否用于写入）。
+static bool pr_page_cache_get_exact(uint64_t remotePage, bool *found) {
+    uint64_t mask = PR_PAGE_CACHE_CAP - 1;
+    uint64_t h = (remotePage >> 14) & mask;
+    for (uint64_t i = 0; i < PR_PAGE_CACHE_CAP; i++) {
+        pr_page_slot_t *s = &gPageCache[(h + i) & mask];
+        if (s->remotePage == remotePage) {
+            if (found) *found = true;
+            return s->exact;
+        }
+        if (s->remotePage == 0) break;
+    }
+    if (found) *found = false;
+    return false;
+}
+
+static void pr_page_cache_put(uint64_t remotePage, uint64_t localPage, bool exact) {
     if (gPageCacheCount >= PR_PAGE_CACHE_CAP) {
         polaris_remote_flush_cache();
     }
@@ -692,10 +894,15 @@ static void pr_page_cache_put(uint64_t remotePage, uint64_t localPage) {
     uint64_t h = (remotePage >> 14) & mask;
     for (uint64_t i = 0; i < PR_PAGE_CACHE_CAP; i++) {
         pr_page_slot_t *s = &gPageCache[(h + i) & mask];
-        if (s->remotePage == remotePage) { s->localPage = localPage; return; }
+        if (s->remotePage == remotePage) {
+            s->localPage = localPage;
+            s->exact     = exact;
+            return;
+        }
         if (s->remotePage == 0) {
             s->remotePage = remotePage;
             s->localPage  = localPage;
+            s->exact      = exact;
             gPageCacheCount++;
             return;
         }
@@ -707,12 +914,21 @@ static void pr_page_cache_put(uint64_t remotePage, uint64_t localPage) {
 /// 于是到上层只剩一句笼统的话。这里把第一次失败的完整原因单独留存。
 static char gFirstFailDetail[192] = {0};
 
+/// 最近一次成功映射用的档位标签（写进 describe 输出）。
+
 /// 把远程一页映射进本进程。
 /// @param remotePage 目标进程里的页首地址（按 pr_page_size() 对齐）
+/// @param outExact   输出：该映射是否精确指向 remotePage（可传 NULL）
 /// @return 本地页首地址（与 remotePage 一一对应）；0 表示失败
-static uint64_t pr_map_remote_page(uint64_t remotePage) {
+static uint64_t pr_map_remote_page(uint64_t remotePage, bool *outExact) {
+    if (outExact) *outExact = false;
+
+    bool cachedFound = false;
     uint64_t local = pr_page_cache_get(remotePage);
-    if (local) return local;
+    if (local) {
+        if (outExact) *outExact = pr_page_cache_get_exact(remotePage, &cachedFound);
+        return local;
+    }
     if (pr_page_is_bad(remotePage)) return 0;
     if (!gRemoteVmMap) {
         pr_set_message("未登记目标 vm_map");
@@ -736,7 +952,8 @@ static uint64_t pr_map_remote_page(uint64_t remotePage) {
         pr_page_mark_bad(remotePage);
         return 0;
     }
-    pr_page_cache_put(remotePage, sh.localAddress);
+    pr_page_cache_put(remotePage, sh.localAddress, sh.exact);
+    if (outExact) *outExact = sh.exact;
     return sh.localAddress;
 }
 
@@ -753,6 +970,7 @@ void polaris_remote_flush_cache(void) {
     memset(gPageNeg, 0, sizeof(gPageNeg));
     gMapFailLogged = 0;
     gFirstFailDetail[0] = '\0';
+    gLastGoodLabel[0] = '\0';
 }
 
 // ---------------------------------------------------------------------------
@@ -785,7 +1003,9 @@ bool polaris_remote_read(uint64_t vaddr, void *out, size_t len) {
                polaris_remote_read(vaddr + first, (char *)out + first, len - first);
     }
 
-    uint64_t local = pr_map_remote_page(page);
+    // 读路径允许使用不精确映射：调用方（如 Mach-O 探测）自带内容校验，
+    // 读到错页会被 magic 挡掉，属于「安全失败」。
+    uint64_t local = pr_map_remote_page(page, NULL);
     if (!local) return false;
     memcpy(out, (const void *)(local + off), len);
     return true;
@@ -805,8 +1025,28 @@ bool polaris_remote_write(uint64_t vaddr, const void *src, size_t len) {
                polaris_remote_write(vaddr + first, (const char *)src + first, len - first);
     }
 
-    uint64_t local = pr_map_remote_page(page);
+    // ★ 写路径**必须**用精确映射。
+    //
+    // 建立映射时若退到了备用 offset（例如 offset=0），映射指向的是
+    // 对象起始处而非目标页；此时写入会改到游戏进程对象的第一页上 ——
+    // 那是静默写错内存，后果比直接失败严重得多。
+    // 所以这里主动拒绝不精确映射，并把原因写进日志。
+    bool exact = false;
+    uint64_t local = pr_map_remote_page(page, &exact);
     if (!local) return false;
+    if (!exact) {
+        pr_set_message("拒绝写入 0x%llx：本地映射不精确（备用 offset 建立），"
+                       "写入会落到对象起始页而非目标页",
+                       (unsigned long long)vaddr);
+        // 保留首次失败原因（如果不是失败、只是不精确，这里补记）
+        if (gFirstFailDetail[0] == '\0') {
+            snprintf(gFirstFailDetail, sizeof(gFirstFailDetail),
+                     "映射不精确（备用 offset）· 拒绝写入 0x%llx",
+                     (unsigned long long)vaddr);
+        }
+        return false;
+    }
+
     memcpy((void *)(local + off), src, len);
     return true;
 }
@@ -842,6 +1082,7 @@ void polaris_remote_describe(char *buffer, int bufferSize) {
         return;
     }
     snprintf(buffer, (size_t)bufferSize,
-             "跨进程访问就绪 · 页大小 %llu KB · 已映射 %d 页",
-             (unsigned long long)(pr_page_size() / 1024), gPageCacheCount);
+             "跨进程访问就绪 · 页大小 %llu KB · 已映射 %d 页 · %s",
+             (unsigned long long)(pr_page_size() / 1024), gPageCacheCount,
+             gLastGoodLabel[0] ? gLastGoodLabel : "尚未建立映射");
 }
