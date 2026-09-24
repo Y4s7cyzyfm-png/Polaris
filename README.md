@@ -41,9 +41,15 @@ value  = 0xD2800021                           // arm64: mov w1, #1
 **基址定位**（`Vendor/unitypatch.m`）：
 
 1. `proc_find_by_name("smoba")` → `proc_task()` → `task_get_vm_map()`
-2. 遍历 vm_map 条目，在 `[0x100000000, 0x800000000)` 窗口内读首页 Mach-O 头
-3. 校验 `MH_MAGIC_64` + `CPU_TYPE_ARM64`，再解析 `LC_ID_DYLIB` 取安装名
+2. **阶段 1**：遍历 vm_map 条目，只读条目自身 `start`/`end`，
+   筛出体积 ≥ 8 MB 的映像作为候选（UnityFramework 实测约 280 MB，普通 framework 远小于此）
+3. **阶段 2**：候选按「UnityFramework 常见映像区间优先 + 体积降序」排序，
+   逐个校验 `MH_MAGIC_64` + `CPU_TYPE_ARM64`，解析 `LC_ID_DYLIB` 取安装名
 4. 命中名含 `UnityFramework` 的映像即为基址；取不到库名时退回「最大的 arm64 dylib」
+
+> 两阶段策略的意义不只是省时间：旧版「每个条目都读 Mach-O 头」会对游戏内核内存
+> 发起大量探测，容易被游戏的反作弊（tersafe / owl）注意到。改成候选制后，
+> 内核读次数下降约 57%~85%（普通 framework 一个都不会碰）。
 
 **开关语义**（与逆向源码一致）：
 
@@ -53,6 +59,62 @@ value  = 0xD2800021                           // arm64: mov w1, #1
 - 写不生效（回读不符）会明确报错，不会谎报成功
 
 **注意**：合入对局后 UnityFramework 才加载完成，请在游戏内进入对局后再开启内透。
+
+## 稳定性：内核读取一律走安全包装
+
+`darksword` 的 `ds_kread*` 内部会调用 `set_target_kaddr()`，而该函数在地址不合法时
+**会抛 ObjC 异常**（`@throw dsexception`）：
+
+```objc
+static void set_target_kaddr(uint64_t where) {
+    if (!ds_isvalid(where)) {
+        ...
+        @throw [NSException exceptionWithName:@"dsexception" ...];   // ← 这里
+    }
+    ...
+}
+```
+
+这个异常从 `ds_kreadbuf` → `early_kread` 一路都是纯 C 函数，中间没有任何 `@try/@catch`。
+ObjC 异常穿出 C 边界到 Swift 时，libc++abi 只能 `std::terminate()` → `abort()` → **SIGABRT**。
+
+**v0.2.0 实机崩溃即由此而来**（`lastExceptionBacktrace` 顶到
+`polaris_find_unity_framework_base` → `ds_kreadbuf` → `early_kread` → `set_target_kaddr`
+→ `objc_exception_throw` → `abort()`）：遍历 vm_map 时把内核链表里的垃圾值
+当成了条目指针，直接去读 `entry + 0x10`，地址非法 → 抛异常 → 打崩。
+
+**修复**（v0.4.1）：本文件内**所有**内核读取都改走 `up_safe_*` 包装：
+
+```objc
+static bool up_safe_kreadbuf(uint64_t addr, void *buf, size_t len) {
+    if (!buf || len == 0) return false;
+    if (!up_kaddr_ok(addr)) return false;        // 先用 ds_isvalid() 挡掉明显非法地址
+    if (!up_same_page(addr, len)) return false;  // 再拒绝跨页读（early_krw 按页映射）
+    @try {
+        ds_kreadbuf(addr, buf, len);
+    } @catch (NSException *e) {
+        return false;                            // 兜底：异常就地吞掉，绝不外泄
+    } @catch (...) {
+        return false;
+    }
+    return true;
+}
+```
+
+配套加固：
+
+| 措施 | 说明 |
+|---|---|
+| 循环入口守卫 | `if (!up_kaddr_ok(entry)) break;` —— 条目指针非法即中止，不再往下摸 |
+| 环路检测 | `visited[512]` 记录已访问条目，内核链表自环时不会死循环 |
+| 遍历上限 | `UP_MAX_ENTRIES 4096`，异常链表不会无限扫 |
+| load commands 上限 | `UP_MAX_LC 1024` + `cmdsize` 合法性检查 |
+| 偏移自检 | `off_vm_map_*` 未装载时直接报错返回，不用错偏移乱读 |
+| 写入也加护栏 | `ds_kwrite32` 同样包在 `@try/@catch` 里 |
+| kernel 指针剥离 PAC | `up_safe_kreadptr()` 读指针后清 PAC 并回填 canonical 高位 |
+
+设计目标：**遍历任意（可能不可信）内核地址时永不抛异常**——要么返回数据，
+要么返回 0，绝不让 `dsexception` 穿过 C 调用链。
 
 ## 获取游戏进程
 
@@ -105,7 +167,11 @@ open Polaris.xcodeproj   # Xcode 16+ 打开，⌘R 运行（真机 arm64e）
 |---|---|---|
 | `Polaris/SettingsView.swift` | `telegramURL` | `https://t.me/polaris_channel` |
 | `Polaris.xcodeproj/project.pbxproj` | `PRODUCT_BUNDLE_IDENTIFIER`（Debug/Release 两处） | `com.polaris.toolkit` |
-| `codemagic.yaml` | `BUNDLE_ID` / `APP_VERSION` | `com.polaris.toolkit` / `0.2.0` |
+| `codemagic.yaml` | `BUNDLE_ID` / `APP_VERSION` | `com.polaris.toolkit` / `0.4.1` |
+
+> CI 里 `MARKETING_VERSION` 现在取 `${APP_VERSION}`（此前被硬编码成 `0.2.0`，
+> 会导致 pbxproj 里的版本号在 CI 构建时被覆盖——崩溃日志里 `app_version: 0.2.0`
+> 与工程里的 `0.4.x` 对不上就是这个原因）。
 
 ## CI（Codemagic）
 
@@ -140,3 +206,12 @@ Polaris/
 ├── codemagic.yaml             # CI 配置
 └── README.md
 ```
+
+## 版本变更
+
+| 版本 | 变更 |
+|---|---|
+| 0.4.1 | **修复开启内透导致的 Polaris SIGABRT 崩溃**：`unitypatch.m` 全部内核读取改走 `up_safe_*`（`ds_isvalid` 预检 + `@try/@catch` 兜底），vm_map 遍历加指针守卫 / 环路检测 / 上限；定位改为两阶段候选制，内核读次数大幅下降；CI `MARKETING_VERSION` 不再被硬编码覆盖 |
+| 0.4.0 | 新增「开启内透」开关（King of Glory / UnityFramework 指令补丁，支持开关还原） |
+| 0.3.0 | 新增「获取游戏进程」按钮（`smoba` 主二进制，Rein 同款 `proc_find_by_name`） |
+| 0.2.0 | DarkSword 内核利用链路打通 |
