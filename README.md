@@ -168,9 +168,40 @@ static void set_target_kaddr(uint64_t where) {
 | `VM_PAGE_PACKED_PTR_SHIFT` | 6 |
 | 压缩指针基准 | `VM_MIN_KERNEL_ADDRESS`（base-relative 当 `bits+shift <= 38`） |
 | `vme_offset` 单位 | **4KB**（`VME_OFFSET(x) = x << 12`），不是设备页大小 |
-| 页大小 | iPhone13,4（A14）16KB；`host_page_size()` 探测，`gPageShift` 兜底 14 |
+| 映射页大小 | **固定 16KB**（`PR_MAP_PAGE_SIZE`），`mach_vm_map` 的 size 与 offset 同源 |
 | 页缓存 | `PR_PAGE_CACHE_CAP 64` 条正向缓存 + 64 条负缓存（记住映射失败的页） |
 | 跨页读写 | 自动分段递归，按页边界切开 |
+
+### 页大小必须只有一个来源（v0.4.4 修复）
+
+v0.4.3 在真机上定位成功、却在读目标页时 **41ms 秒退**。根因是
+`mach_vm_map` 的 `size` 与 `offset` 用了**两个不同的页大小来源**：
+
+```c
+mach_vm_map(..., PAGE_SIZE /* 编译期 16384 */, ...,
+            memobj, object->entryOffset /* 按运行时 pr_page_size() 算 */, ...);
+```
+
+而 `pr_detect_page_size()` 里有一条 4KB 分支：
+
+```c
+if (ps >= 16384)      gPageShift = 14;
+else if (ps >= 4096)  gPageShift = 12;   // ← 一旦命中，page 按 4KB 对齐
+```
+
+这会算出 `offset = 0x9e3f000`、而 `size = 0x4000`，`offset % size != 0`，
+内核直接以 `KERN_INVALID_ADDRESS` 拒绝。
+
+修法：
+
+1. 新增 `PR_MAP_PAGE_SIZE`（16KB），映射层的 `size` 与 `offset` 都由它推出；
+2. `pr_detect_page_size()` 不再接受 4096，一律提升到 16KB，与该常量自洽；
+3. 显式校验 `entryOffset` 的 16KB 对齐（`entryOffset = (page - entry.start) + (vme_offset << 12)`，
+   普通 Mach-O `__TEXT` 的 `vme_offset` 恒为 0，正常必然对齐），
+   万一不对齐**直接报错**而不是硬凑 offset —— 硬凑会读到错位字节，比失败更危险。
+
+> 曾尝试「把 offset 下取整到 16KB，再用 delta 补偿页内偏移」，
+> 仿真发现 delta 较大时本地窗口会整体前移、反而覆盖不到目标地址，故弃用。
 
 ### 读取路径的分层
 
@@ -239,7 +270,7 @@ open Polaris.xcodeproj   # Xcode 16+ 打开，⌘R 运行（真机 arm64e）
 |---|---|---|
 | `Polaris/SettingsView.swift` | `telegramURL` | `https://t.me/polaris_channel` |
 | `Polaris.xcodeproj/project.pbxproj` | `PRODUCT_BUNDLE_IDENTIFIER`（Debug/Release 两处） | `com.polaris.toolkit` |
-| `codemagic.yaml` | `BUNDLE_ID` / `APP_VERSION` | `com.polaris.toolkit` / `0.4.3` |
+| `codemagic.yaml` | `BUNDLE_ID` / `APP_VERSION` | `com.polaris.toolkit` / `0.4.4` |
 
 > CI 里 `MARKETING_VERSION` 现在取 `${APP_VERSION}`（此前被硬编码成 `0.2.0`，
 > 会导致 pbxproj 里的版本号在 CI 构建时被覆盖——崩溃日志里 `app_version: 0.2.0`
@@ -283,6 +314,7 @@ Polaris/
 
 | 版本 | 变更 |
 |---|---|
+| 0.4.4 | **修复「目标地址读不到内容」（41ms 秒退）**：`mach_vm_map` 的 `size` 取编译期 `PAGE_SIZE`(16KB)、`offset` 取按运行时 `pr_page_size()` 算出的 `entryOffset`，两个页大小来源不一致；当 `host_page_size()` 返回 4096 时 `offset % size != 0`，内核以 `KERN_INVALID_ADDRESS` 拒绝。改为统一用 `PR_MAP_PAGE_SIZE`(16KB)，`pr_detect_page_size()` 不再接受 4KB，并新增 `entryOffset` 的 16KB 对齐校验（不对齐直接报错，不硬凑 offset）。同时把映射失败的**真实内核返回码**透出到日志，取代原先误导性的「映像可能未加载」 |
 | 0.4.3 | **修复「未找到 UnityFramework 映像」（36ms 秒退）**：根因是 `ds_kread*`/`ds_kwrite*` 只认内核地址，而 UnityFramework 基址与内透目标都是 smoba 用户态地址，被 `ds_isvalid` 全数拒掉。新增 `remotepage.{h,m}` 跨进程访问层——移植 Rein `TaskRop/vm.m` 的 **vm_object 共享映射**（vtop 在 iOS 18.6 上语义不符，已排除），把目标页映射进本进程后用 `memcpy` 读写；读取路径按目标分成 `up_safe_kread*`（内核对象）/ `up_user_read*`（smoba 用户态）两层；内透写入改走 `up_user_write()` 而非 `ds_kwrite32`；定位前先 `polaris_remote_set_target(vmMap)` 登记目标进程，开启/关闭路径带自愈重登记 |
 | 0.4.2 | **修复内透定位到错误基址**：去掉「校验失败时退回体积最大条目」的危险兜底（smoba 有个 ~9.8GB 匿名映射，体积碾压 UnityFramework 的 280MB，导致基址错到 `0x274000000`）；阶段 1 增加页对齐筛选，候选上限提到 64 且不再按体积裁剪；排序改为「特征区间 → 合理库大小（≤2GB）→ 体积降序」；新增基址/目标地址的最终窗口闸门，越界即放弃 |
 | 0.4.1 | **修复开启内透导致的 Polaris SIGABRT 崩溃**：`unitypatch.m` 全部内核读取改走 `up_safe_*`（`ds_isvalid` 预检 + `@try/@catch` 兜底），vm_map 遍历加指针守卫 / 环路检测 / 上限；定位改为两阶段候选制，内核读次数大幅下降；CI `MARKETING_VERSION` 不再被硬编码覆盖 |

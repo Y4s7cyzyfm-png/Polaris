@@ -75,7 +75,7 @@ struct SettingsView: View {
 
     private var aboutCard: some View {
         Card(title: "关于") {
-            aboutRow(title: "版本", value: "0.4.3")
+            aboutRow(title: "版本", value: "0.4.4")
             CardDivider()
             aboutRow(title: "项目代号", value: "Polaris · 北极星")
             CardDivider()
