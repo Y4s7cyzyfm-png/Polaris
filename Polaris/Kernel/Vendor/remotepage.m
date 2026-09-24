@@ -12,7 +12,9 @@
 #import <Foundation/Foundation.h>
 #import <mach/mach.h>
 #import <mach/mach_host.h>
+#import <mach/mach_vm.h>
 #import <mach/vm_map.h>
+#import <mach/vm_page_size.h>
 #import <string.h>
 #import <stdio.h>
 #import <stdarg.h>
@@ -119,9 +121,24 @@ struct pr_vmobj {
 #define PR_PACKED_PTR_SHIFT               6
 #define PR_KERNEL_POINTER_SIGNIFICANT_BITS 38
 
-// mach_vm_allocate / mach_vm_deallocate / mach_vm_map 由 <mach/vm_map.h> 提供，
-// 这里**不要**再手写 extern：手写的签名缺 task_t 等类型声明，
-// 且会与实际 SDK 里的 _Nullable / audit_token 属性冲突。
+// mach_vm_allocate / mach_vm_deallocate / mach_vm_map 这三个**必须**手写 extern。
+//
+// iOS SDK 里它们定义在 <mach/mach_vm.h>，而 <mach/vm_map.h> 只提供
+// vm_map_t / vm_prot_t 这些类型，并不声明这三个函数。不手写声明就会：
+//   error: call to undeclared function 'mach_vm_allocate'
+//   [-Wimplicit-function-declaration]（CI 上 -Werror=implicit-function-declaration 直接挂）
+//
+// 签名与 Rein TaskRop/vm.m:20-22 完全一致 —— 那边在同一个 SDK 上已验证可编译。
+extern kern_return_t mach_vm_allocate(task_t task, mach_vm_address_t *addr,
+                                      mach_vm_size_t size, int flags);
+extern kern_return_t mach_vm_deallocate(task_t task, mach_vm_address_t addr,
+                                        mach_vm_size_t size);
+extern kern_return_t mach_vm_map(vm_map_t target_task, mach_vm_address_t *address,
+                                 mach_vm_size_t size, mach_vm_offset_t mask, int flags,
+                                 mem_entry_name_port_t object,
+                                 memory_object_offset_t offset, boolean_t copy,
+                                 vm_prot_t cur_protection, vm_prot_t max_protection,
+                                 vm_inherit_t inheritance);
 
 // ---------------------------------------------------------------------------
 // 全局状态
@@ -317,6 +334,18 @@ static struct pr_vmobj pr_vm_get_object(uint64_t vmMap, uint64_t address) {
 // 核心：把目标进程的一页映射进本进程
 // ---------------------------------------------------------------------------
 
+/// 按 vm 页大小向上取整。
+///
+/// 故意自己实现而不用 SDK 的 `mach_vm_round_page()`：那个函数在 Apple SDK 里
+/// 由 <mach/mach.h> 间接带进来，但在只 include <mach/vm_map.h> 的编译单元里
+/// 可能不可见，会触发 `-Werror=implicit-function-declaration` 直接编译失败。
+/// 自己写一个，不依赖任何头文件，行为与 SDK 完全一致（按 PAGE_SIZE 进位）。
+static inline uint64_t pr_round_page(uint64_t x) {
+    const uint64_t page = (uint64_t)PAGE_SIZE;
+    if (page == 0) return x;
+    return (x + page - 1) & ~(page - 1);
+}
+
 static polaris_vmshmem_t pr_create_shmem_with_obj(struct pr_vmobj *object) {
     polaris_vmshmem_t shmem = {0};
 
@@ -327,8 +356,8 @@ static polaris_vmshmem_t pr_create_shmem_with_obj(struct pr_vmobj *object) {
         pr_set_message("读取 vm_object 大小失败");
         return shmem;
     }
-    size = mach_vm_round_page(size);
-    uint64_t roundedsize = mach_vm_round_page(size);
+    size = pr_round_page(size);
+    uint64_t roundedsize = pr_round_page(size);
     if (roundedsize == 0) {
         pr_set_message("vm_object 尺寸为 0");
         return shmem;
