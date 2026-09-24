@@ -12,12 +12,17 @@
 #import <Foundation/Foundation.h>
 #import <mach/mach.h>
 #import <mach/mach_host.h>
-#import <mach/mach_vm.h>
 #import <mach/vm_map.h>
 #import <mach/vm_page_size.h>
 #import <string.h>
 #import <stdio.h>
 #import <stdarg.h>
+
+// ⚠️ 绝对不要 #import <mach/mach_vm.h>。
+// Apple 的 iOS SDK 里这个头文件是一个**刻意的报错占位**，整个文件只有一行：
+//     #error mach_vm.h unsupported.
+// 引入它必然编译失败。mach_vm_allocate / mach_vm_deallocate / mach_vm_map
+// 的正确做法是在下面手写 extern（Rein TaskRop/vm.m:20-22 就是这么做的）。
 
 #import "darksword.h"
 #import "offsets.h"
@@ -123,8 +128,10 @@ struct pr_vmobj {
 
 // mach_vm_allocate / mach_vm_deallocate / mach_vm_map 这三个**必须**手写 extern。
 //
-// iOS SDK 里它们定义在 <mach/mach_vm.h>，而 <mach/vm_map.h> 只提供
-// vm_map_t / vm_prot_t 这些类型，并不声明这三个函数。不手写声明就会：
+// 它们由 libsystem_kernel 导出，但 Apple 的 iOS SDK 里**没有任何头文件**声明它们：
+//   - <mach/vm_map.h>     只提供 vm_map_t / vm_prot_t 这些类型和宏，不声明函数
+//   - <mach/mach_vm.h>    是刻意的报错占位（整个文件只有 #error），不能 include
+// 不手写声明就会：
 //   error: call to undeclared function 'mach_vm_allocate'
 //   [-Wimplicit-function-declaration]（CI 上 -Werror=implicit-function-declaration 直接挂）
 //
@@ -336,10 +343,10 @@ static struct pr_vmobj pr_vm_get_object(uint64_t vmMap, uint64_t address) {
 
 /// 按 vm 页大小向上取整。
 ///
-/// 故意自己实现而不用 SDK 的 `mach_vm_round_page()`：那个函数在 Apple SDK 里
-/// 由 <mach/mach.h> 间接带进来，但在只 include <mach/vm_map.h> 的编译单元里
-/// 可能不可见，会触发 `-Werror=implicit-function-declaration` 直接编译失败。
-/// 自己写一个，不依赖任何头文件，行为与 SDK 完全一致（按 PAGE_SIZE 进位）。
+/// 故意自己实现而不用 SDK 的 `mach_vm_round_page()`：那个函数同样没有任何
+/// 可 include 的头文件声明它（见上方 extern 块的说明），直接用会触发
+/// `-Werror=implicit-function-declaration` 编译失败。
+/// 自己写一个，行为与 SDK 完全一致（按 PAGE_SIZE 进位）。
 static inline uint64_t pr_round_page(uint64_t x) {
     const uint64_t page = (uint64_t)PAGE_SIZE;
     if (page == 0) return x;
