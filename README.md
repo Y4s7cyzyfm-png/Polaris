@@ -116,6 +116,77 @@ static bool up_safe_kreadbuf(uint64_t addr, void *buf, size_t len) {
 设计目标：**遍历任意（可能不可信）内核地址时永不抛异常**——要么返回数据，
 要么返回 0，绝不让 `dsexception` 穿过 C 调用链。
 
+## 跨进程访问：为什么不能直接 `ds_kwrite32`
+
+这是 v0.4.3 的核心修复。`ds_kread*` / `ds_kwrite*` **只能读写内核地址**：
+
+```objc
+static void set_target_kaddr(uint64_t where) {
+    if (!ds_isvalid(where)) @throw dsexception;   // ds_isvalid 只认 0xffffff.. / 0xfffffe..
+    ...
+}
+```
+
+`where` 在底层被当成**内核虚拟地址**塞进 `icmp6filter` 指针里做读写，
+所以用户态地址**永远不可能**被 `ds_*` 直接访问。
+
+而内透目标是 `UnityFrameworkBase + 0x09E3F824` —— 这是 **smoba 的用户态地址**
+（实测 `0x12145F824`）。于是 v0.4.2 的表现是：
+
+```
+09:10:18.992  stage: 正在定位 UnityFramework
+09:10:19.028  stage: 未找到 UnityFramework 映像，请确认游戏已进入对局
+```
+
+**只用了 36ms** —— 因为 `up_probe_macho()` 走的还是 `up_safe_kreadbuf()`
+（带 `ds_isvalid` 预检），每个候选都在第一字节就被拒，一轮下来秒退。
+
+### vtop 为什么也不行
+
+最直觉的方案是 vtop（遍历页表把虚拟地址翻成物理地址）。但 [Rein](https://github.com/Y4s7cyzyfm-png/Rein)
+作者在 iOS 18.6 真机上实测后写下了结论：
+
+> 读取——不再走 `ptov_table` / `pmap` 页表遍历（iOS 18.6 上两者语义均与预期不符）。
+
+### 采用的方案：vm_object 共享映射
+
+`Vendor/remotepage.{h,m}`，移植自 Rein 的 `TaskRop/vm.m`（原作者真机验证过）：
+
+1. 在目标 `vm_map` 里找到目标地址所属的 `vm_map_entry`
+2. 从 entry 解出该页的 `vm_object`（`vme_object_or_delta` 是**压缩指针**）
+3. 把 `vm_object` 引用计数 `+1`（否则映射建立后对象可能被回收）
+4. 在本进程造一个 `memory entry`，篡改其 backing `vm_map_entry`，
+   让 `vme_object` 指向目标对象、`vme_offset` 指向目标页
+5. `mach_vm_map` 把这一页映射进**本进程**地址空间
+6. 之后直接 `memcpy` —— 读写都退化成普通用户态内存访问
+
+关键点：
+
+| 项 | 值 / 说明 |
+|---|---|
+| `VM_PAGE_PACKED_PTR_BITS` | 31 |
+| `VM_PAGE_PACKED_PTR_SHIFT` | 6 |
+| 压缩指针基准 | `VM_MIN_KERNEL_ADDRESS`（base-relative 当 `bits+shift <= 38`） |
+| `vme_offset` 单位 | **4KB**（`VME_OFFSET(x) = x << 12`），不是设备页大小 |
+| 页大小 | iPhone13,4（A14）16KB；`host_page_size()` 探测，`gPageShift` 兜底 14 |
+| 页缓存 | `PR_PAGE_CACHE_CAP 64` 条正向缓存 + 64 条负缓存（记住映射失败的页） |
+| 跨页读写 | 自动分段递归，按页边界切开 |
+
+### 读取路径的分层
+
+修复后 `unitypatch.m` 的读取分成明确两层：
+
+| 函数族 | 目标 | 底层 |
+|---|---|---|
+| `up_safe_kread*` | **内核对象**（`vm_map` / `vm_map_entry` / `vm_object` / `proc` / `task`） | `ds_kreadbuf` + `ds_isvalid` 预检 + `@try/@catch` |
+| `up_user_read*` | **smoba 用户态**（Mach-O 头、UnityFramework 指令） | `polaris_remote_*` → vm_object 共享映射 + `memcpy` |
+
+内透写入同理走 `up_user_write()`（== `polaris_remote_write()`），
+不再是 `ds_kwrite32`——后者写用户态地址会被 `ds_isvalid` 直接拒掉。
+
+> **踩坑记录**：`up_safe_kreadstr()` 已删除。它只在读内核字符串时有用，
+> 而 Mach-O 的 `LC_ID_DYLIB` 名字在 smoba 用户态，必须走 `up_user_readstr()`。
+
 ## 获取游戏进程
 
 「获取游戏进程」读取的是游戏主二进制 `smoba` 的进程，实现方式与 [Rein](https://github.com/Y4s7cyzyfm-png/Rein) 的
@@ -149,6 +220,7 @@ DarkSword 内核利用代码来自 [Rein](https://github.com/Y4s7cyzyfm-png/Rein
 - 支撑：`pe/`（vfs / sbx / vnode / xpaci）、`fileport.h`
 - 游戏进程：`gameproc.m`（按进程名解析 `smoba`，见上一节）
 - 内透补丁：`unitypatch.m`（跨进程定位 UnityFramework + 指令补丁，见上一节）
+- 跨进程内存：`remotepage.m`（vm_object 共享映射 + 页缓存，见上一节）
 - 预编译库：`libxpf.dylib`、`libgrabkernel2.dylib`（arm64e thin，运行时从 `Frameworks/` 加载）
 - persistence 使用 stub（`transfer_krw_to_launchd` 不启用）
 - 不含：RemoteCall、TaskRop、choma、decrypt/ota/screentime 等非必需模块
@@ -167,7 +239,7 @@ open Polaris.xcodeproj   # Xcode 16+ 打开，⌘R 运行（真机 arm64e）
 |---|---|---|
 | `Polaris/SettingsView.swift` | `telegramURL` | `https://t.me/polaris_channel` |
 | `Polaris.xcodeproj/project.pbxproj` | `PRODUCT_BUNDLE_IDENTIFIER`（Debug/Release 两处） | `com.polaris.toolkit` |
-| `codemagic.yaml` | `BUNDLE_ID` / `APP_VERSION` | `com.polaris.toolkit` / `0.4.2` |
+| `codemagic.yaml` | `BUNDLE_ID` / `APP_VERSION` | `com.polaris.toolkit` / `0.4.3` |
 
 > CI 里 `MARKETING_VERSION` 现在取 `${APP_VERSION}`（此前被硬编码成 `0.2.0`，
 > 会导致 pbxproj 里的版本号在 CI 构建时被覆盖——崩溃日志里 `app_version: 0.2.0`
@@ -211,6 +283,7 @@ Polaris/
 
 | 版本 | 变更 |
 |---|---|
+| 0.4.3 | **修复「未找到 UnityFramework 映像」（36ms 秒退）**：根因是 `ds_kread*`/`ds_kwrite*` 只认内核地址，而 UnityFramework 基址与内透目标都是 smoba 用户态地址，被 `ds_isvalid` 全数拒掉。新增 `remotepage.{h,m}` 跨进程访问层——移植 Rein `TaskRop/vm.m` 的 **vm_object 共享映射**（vtop 在 iOS 18.6 上语义不符，已排除），把目标页映射进本进程后用 `memcpy` 读写；读取路径按目标分成 `up_safe_kread*`（内核对象）/ `up_user_read*`（smoba 用户态）两层；内透写入改走 `up_user_write()` 而非 `ds_kwrite32`；定位前先 `polaris_remote_set_target(vmMap)` 登记目标进程，开启/关闭路径带自愈重登记 |
 | 0.4.2 | **修复内透定位到错误基址**：去掉「校验失败时退回体积最大条目」的危险兜底（smoba 有个 ~9.8GB 匿名映射，体积碾压 UnityFramework 的 280MB，导致基址错到 `0x274000000`）；阶段 1 增加页对齐筛选，候选上限提到 64 且不再按体积裁剪；排序改为「特征区间 → 合理库大小（≤2GB）→ 体积降序」；新增基址/目标地址的最终窗口闸门，越界即放弃 |
 | 0.4.1 | **修复开启内透导致的 Polaris SIGABRT 崩溃**：`unitypatch.m` 全部内核读取改走 `up_safe_*`（`ds_isvalid` 预检 + `@try/@catch` 兜底），vm_map 遍历加指针守卫 / 环路检测 / 上限；定位改为两阶段候选制，内核读次数大幅下降；CI `MARKETING_VERSION` 不再被硬编码覆盖 |
 | 0.4.0 | 新增「开启内透」开关（King of Glory / UnityFramework 指令补丁，支持开关还原） |

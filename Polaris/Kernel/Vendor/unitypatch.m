@@ -37,6 +37,7 @@
 #import "darksword.h"
 #import "gameproc.h"
 #import "offsets.h"
+#import "remotepage.h"
 #import "utils.h"
 
 // ---------------------------------------------------------------------------
@@ -132,6 +133,11 @@ static inline bool up_same_page(uint64_t addr, size_t len) {
 // ---------------------------------------------------------------------------
 
 /// 内核地址是否「看起来可读」：非 0 且落在内核/zone 区间。
+///
+/// ⚠️ 这里**只能**用于内核对象（vm_map / vm_map_entry / vm_object / proc / task）。
+/// ds_isvalid 只认 0xffffff.. / 0xfffffe.. 开头的内核地址，
+/// smoba 的用户态地址（如 0x117620000）传进来必然被判非法。
+/// 读游戏进程自己的内存请用 up_user_read* 那一组。
 static inline bool up_kaddr_ok(uint64_t addr) {
     return addr != 0 && ds_isvalid(addr);
 }
@@ -181,25 +187,72 @@ static uint64_t up_safe_kreadptr(uint64_t addr) {
     return up_kaddr_ok(p) ? p : 0;
 }
 
-/// 安全读取一段内核内存里的 C 字符串。
-static bool up_safe_kreadstr(uint64_t addr, char *out, size_t outSize) {
-    if (!out || outSize < 2) return false;
-    if (!up_kaddr_ok(addr)) return false;
+// ---------------------------------------------------------------------------
+// 用户态读取（读 smoba 自己的内存）
+//
+// ★ 这是整个内透功能的**关键转折点**。
+//
+// ds_kread* / ds_kwrite* 只认内核地址（见 up_kaddr_ok 的注释），
+// 所以「读 smoba 的 Mach-O 头」「改 smoba 的 UnityFramework 代码」
+// 都不可能直接用 ds_*。
+//
+// 走 remotepage 的 vm_object 共享映射：把目标页映射进本进程，
+// 然后直接 memcpy —— 读写都退化成普通用户态内存访问。
+// ---------------------------------------------------------------------------
 
-    // 逐页分段读，避免跨页被 up_same_page 拒绝
+/// 从游戏进程读 len 字节（走 vm_object 共享映射，永不抛异常）。
+static bool up_user_read(uint64_t addr, void *buf, size_t len) {
+    if (!buf || len == 0) return false;
+    if (!up_is_user_pointer(addr)) return false;
+    // 溢出保护：addr + len 不能越过映像窗口上界
+    if (addr + (uint64_t)len < addr) return false;
+    if (addr + (uint64_t)len > UP_IMAGE_MAX) return false;
+
+    return polaris_remote_read(addr, buf, len);
+}
+
+/// 向游戏进程写 len 字节。
+static bool up_user_write(uint64_t addr, const void *src, size_t len) {
+    if (!src || len == 0) return false;
+    if (!up_is_user_pointer(addr)) return false;
+    if (addr + (uint64_t)len < addr) return false;
+    if (addr + (uint64_t)len > UP_IMAGE_MAX) return false;
+
+    return polaris_remote_write(addr, src, len);
+}
+
+static uint64_t up_user_read64(uint64_t addr, bool *ok) {
+    uint64_t v = 0;
+    bool r = up_user_read(addr, &v, sizeof(v));
+    if (ok) *ok = r;
+    return r ? v : 0;
+}
+
+static uint32_t up_user_read32(uint64_t addr, bool *ok) {
+    uint32_t v = 0;
+    bool r = up_user_read(addr, &v, sizeof(v));
+    if (ok) *ok = r;
+    return r ? v : 0;
+}
+
+/// 读取用户态内存里的 C 字符串（逐页分段，不要求同页）。
+static bool up_user_readstr(uint64_t addr, char *out, size_t outSize) {
+    if (!out || outSize < 2) return false;
+    if (!up_is_user_pointer(addr)) return false;
+
     size_t got = 0;
     uint64_t cur = addr;
     while (got + 1 < outSize) {
         size_t room = outSize - 1 - got;
         size_t chunk = 64;
-        // 限制在本页内
+        // 限本页内（remotepage 自己能跨页，但按页切更省映射）
         size_t pageLeft = 0x1000 - (size_t)(cur & 0xFFF);
         if (chunk > pageLeft) chunk = pageLeft;
         if (chunk > room) chunk = room;
         if (chunk == 0) break;
 
         char tmp[64];
-        if (!up_safe_kreadbuf(cur, tmp, chunk)) break;
+        if (!up_user_read(cur, tmp, chunk)) break;
 
         bool done = false;
         for (size_t i = 0; i < chunk; i++) {
@@ -250,23 +303,25 @@ static up_offsets_t up_vm_offsets(void) {
 // ---------------------------------------------------------------------------
 
 /// 读取 Mach-O 头，判断是否是 arm64 的某个映像，并尝试取出 LC_ID_DYLIB 里的名字。
-/// 全程走 up_safe_* —— 调用者传入的 base 来自内核条目，属于不可信数据。
+///
+/// ★ base 是 **smoba 的用户态地址**，必须走 up_user_*（vm_object 共享映射）；
+/// 用 up_safe_* 会被 ds_isvalid 直接拒掉，表现就是「探测全失败 → 36ms 报未找到」。
 static bool up_probe_macho(uint64_t base, uint32_t *outFileType,
                            char *installedName, size_t installedNameSize) {
     if (!up_is_user_pointer(base)) return false;
 
     uint32_t magic_le = 0;
-    if (!up_safe_kreadbuf(base, &magic_le, sizeof(magic_le))) return false;
+    if (!up_user_read(base, &magic_le, sizeof(magic_le))) return false;
     if (magic_le != MH_MAGIC_64) return false;
 
     uint32_t cputype = 0;
     uint32_t filetype = 0;
     uint32_t ncmds = 0;
     uint32_t sizeofcmds = 0;
-    if (!up_safe_kreadbuf(base + 0x04, &cputype, sizeof(cputype))) return false;
-    if (!up_safe_kreadbuf(base + 0x0C, &filetype, sizeof(filetype))) return false;
-    if (!up_safe_kreadbuf(base + 0x10, &ncmds, sizeof(ncmds))) return false;
-    if (!up_safe_kreadbuf(base + 0x14, &sizeofcmds, sizeof(sizeofcmds))) return false;
+    if (!up_user_read(base + 0x04, &cputype, sizeof(cputype))) return false;
+    if (!up_user_read(base + 0x0C, &filetype, sizeof(filetype))) return false;
+    if (!up_user_read(base + 0x10, &ncmds, sizeof(ncmds))) return false;
+    if (!up_user_read(base + 0x14, &sizeofcmds, sizeof(sizeofcmds))) return false;
 
     if (cputype != CPU_TYPE_ARM64) return false;
     if (filetype != MH_DYLIB && filetype != MH_EXECUTE) return false;
@@ -283,19 +338,19 @@ static bool up_probe_macho(uint64_t base, uint32_t *outFileType,
     for (uint32_t i = 0; i < limit; i++) {
         uint32_t cmd = 0, cmdsize = 0;
         bool ok1 = false, ok2 = false;
-        cmd     = up_safe_kread32((uint64_t)lc, &ok1);
-        cmdsize = up_safe_kread32((uint64_t)lc + 4, &ok2);
+        cmd     = up_user_read32((uint64_t)lc, &ok1);
+        cmdsize = up_user_read32((uint64_t)lc + 4, &ok2);
         if (!ok1 || !ok2) break;
         if (cmdsize < 8 || cmdsize > 0x10000) break;
 
         if (cmd == LC_ID_DYLIB) {
             // dylib_command: cmd, cmdsize, dylib.name.offset (uint32 @ +8)
-            uint32_t nameoff = up_safe_kread32((uint64_t)lc + 8, NULL);
+            uint32_t nameoff = up_user_read32((uint64_t)lc + 8, NULL);
             if (nameoff > 8 && nameoff < cmdsize) {
                 char buf[256] = {0};
                 size_t want = sizeof(buf) - 1;
                 if (want > cmdsize - nameoff) want = cmdsize - nameoff;
-                if (up_safe_kreadstr((uint64_t)lc + nameoff, buf, want + 1)) {
+                if (up_user_readstr((uint64_t)lc + nameoff, buf, want + 1)) {
                     strlcpy(installedName, buf, installedNameSize);
                 }
             }
@@ -312,7 +367,10 @@ static bool up_probe_macho(uint64_t base, uint32_t *outFileType,
 // ---------------------------------------------------------------------------
 
 uint64_t polaris_find_unity_framework_base(void) {
-    if (gUnityBase != 0 && ds_isvalid(gUnityBase)) return gUnityBase;
+    // 命中缓存：注意 gUnityBase 是**用户态**地址，不能用 ds_isvalid 校验
+    if (gUnityBase != 0 && up_is_user_pointer(gUnityBase) && up_is_user_pointer(gTargetAddr)) {
+        return gUnityBase;
+    }
     gUnityBase = 0;
     gTargetAddr = 0;
 
@@ -344,6 +402,12 @@ uint64_t polaris_find_unity_framework_base(void) {
         up_set_message("取不到游戏进程 vm_map");
         return 0;
     }
+
+    // ★★ 关键一步：把目标 vm_map 登记给跨进程访问层。
+    // 之后所有 up_user_*（读 Mach-O 头、写内透指令）都靠它做
+    // vm_object 共享映射。不登记的话 up_user_read 全部返回 false，
+    // 表现就是「候选全被否 → 未找到 UnityFramework」。
+    polaris_remote_set_target(vmMap);
 
     up_offsets_t O = up_vm_offsets();
 
@@ -551,15 +615,30 @@ bool polaris_enable_transparent_wall(void) {
     if (gTargetAddr == 0 && polaris_find_unity_framework_base() == 0) {
         return false; // 文案已在定位函数里写好
     }
-    if (!up_kaddr_ok(gTargetAddr)) {
+    // 目标地址是 smoba 的用户态地址，必须走用户态窗口校验
+    if (!up_is_user_pointer(gTargetAddr)) {
         up_set_message("内透目标地址无效（0x%llx）", gTargetAddr);
         return false;
+    }
+
+    // 自愈：正常情况下 polaris_find_unity_framework_base() 里已经登记过 vm_map，
+    // 但如果走的是「命中缓存」那条早返回分支（gTargetAddr 已存在），
+    // 或者游戏重启过导致旧 vm_map 失效，这里必须重新登记。
+    if (!polaris_remote_target()) {
+        uint64_t proc = proc_find_by_name(POLARIS_GAME_PROCESS_NAME);
+        uint64_t task = (proc && ds_isvalid(proc)) ? proc_task(proc) : 0;
+        uint64_t vmMap = (task && ds_isvalid(task)) ? task_get_vm_map(task) : 0;
+        if (!vmMap || !ds_isvalid(vmMap)) {
+            up_set_message("跨进程访问未就绪，请先点「获取游戏进程」");
+            return false;
+        }
+        polaris_remote_set_target(vmMap);
     }
 
     // 备份原始指令（只备份一次，重复开启不会覆盖真原始值）
     if (!gHaveBackup) {
         bool ok = false;
-        uint32_t current = up_safe_kread32(gTargetAddr, &ok);
+        uint32_t current = up_user_read32(gTargetAddr, &ok);
         if (!ok) {
             up_set_message("目标地址读不到内容，映像可能未加载");
             return false;
@@ -577,22 +656,19 @@ bool polaris_enable_transparent_wall(void) {
         return false;
     }
 
-    @try {
-        ds_kwrite32(gTargetAddr, UNITY_PATCH_VALUE);
-    } @catch (NSException *e) {
+    // ★ 写入走 vm_object 共享映射（目标页已映射进本进程），不是 ds_kwrite32。
+    // ds_kwrite32 只认内核地址，写用户态地址会被 ds_isvalid 拒掉。
+    if (!up_user_write(gTargetAddr, &(uint32_t){ UNITY_PATCH_VALUE }, sizeof(uint32_t))) {
         gEnabled = false;
-        const char *why = e.reason ? [e.reason UTF8String] : "unknown";
-        up_set_message("内透写入异常：%s", why ? why : "unknown");
-        return false;
-    } @catch (...) {
-        gEnabled = false;
-        up_set_message("内透写入异常");
+        char detail[192] = {0};
+        polaris_remote_describe(detail, (int)sizeof(detail));
+        up_set_message("内透写入失败（%s）", detail[0] ? detail : "无法映射目标页");
         return false;
     }
 
-    // 回读校验：内核写不生效时不要谎报成功
+    // 回读校验：写不生效时不要谎报成功
     bool okV = false;
-    uint32_t verify = up_safe_kread32(gTargetAddr, &okV);
+    uint32_t verify = up_user_read32(gTargetAddr, &okV);
     if (!okV || verify != UNITY_PATCH_VALUE) {
         gEnabled = false;
         up_set_message("内透写入未生效（回读 0x%08X，期望 0x%08X）",
@@ -616,24 +692,37 @@ bool polaris_disable_transparent_wall(void) {
         up_set_message("请先启动内核利用");
         return false;
     }
-    if (!up_kaddr_ok(gTargetAddr)) {
+    if (!up_is_user_pointer(gTargetAddr)) {
         gEnabled = false;
         up_set_message("目标地址已失效，无法还原");
         return false;
     }
-
-    @try {
-        ds_kwrite32(gTargetAddr, gOriginalInstruction);
-    } @catch (NSException *e) {
-        const char *why = e.reason ? [e.reason UTF8String] : "unknown";
-        up_set_message("内透还原异常：%s", why ? why : "unknown");
+    if (!polaris_remote_target()) {
+        up_set_message("跨进程访问未就绪，无法还原");
         return false;
-    } @catch (...) {
-        up_set_message("内透还原异常");
+    }
+
+    if (!up_user_write(gTargetAddr, &gOriginalInstruction, sizeof(gOriginalInstruction))) {
+        char detail[192] = {0};
+        polaris_remote_describe(detail, (int)sizeof(detail));
+        up_set_message("内透还原失败（%s）", detail[0] ? detail : "无法映射目标页");
+        return false;
+    }
+
+    // 回读校验还原结果。注意：目标页可能已被游戏重新映射（换了 vm_object），
+    // 所以「读失败」不算还原失败——写已经发出去了，读不到只是映射变了。
+    // 只有「读到了但值不对」才报错。
+    bool okV = false;
+    uint32_t verify = up_user_read32(gTargetAddr, &okV);
+    if (okV && verify != gOriginalInstruction) {
+        up_set_message("内透还原未生效（回读 0x%08X，期望 0x%08X）",
+                       verify, gOriginalInstruction);
         return false;
     }
 
     gEnabled = false;
+    // 还原完成后释放本地映射，避免长期占用 smoba 页的引用
+    polaris_remote_flush_cache();
     up_set_message("内透已关闭 · 已还原 0x%08X", gOriginalInstruction);
     return true;
 }
