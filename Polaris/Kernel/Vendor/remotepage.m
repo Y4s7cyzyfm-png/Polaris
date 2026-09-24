@@ -419,6 +419,12 @@ static polaris_vmshmem_t pr_create_shmem_with_obj(struct pr_vmobj *object) {
     }
 
     // 3) 为这块内存造一个 memory entry
+    //
+    // ★ entrysize 是 in/out 参数：内核可能把它改小（例如按实际可共享范围钳制），
+    //   所以调用后必须回读，不能继续用请求值。
+    //   后面 mach_vm_map 的 offset 必须落在 **回读后** 的 entrysize 之内，
+    //   否则会撞上 XNU vm_map.c:4155 的守卫：
+    //       if (named_entry->size < obj_offs + initial_size) return KERN_INVALID_ARGUMENT;
     mach_port_t memobj = MACH_PORT_NULL;
     memory_object_size_t entrysize = roundedsize;
     ret = mach_make_memory_entry_64(mach_task_self_, &entrysize,
@@ -430,6 +436,9 @@ static polaris_vmshmem_t pr_create_shmem_with_obj(struct pr_vmobj *object) {
         mach_vm_deallocate(mach_task_self_, localaddr, roundedsize);
         return shmem;
     }
+    // 回读内核实际给出的 entry 大小；若内核没回填（返回 0）则退回请求值，
+    // 避免因为一个未定义的回填把正常路径也堵死。
+    memory_object_size_t realEntrySize = entrysize ? entrysize : roundedsize;
 
     // 4) 顺着 memory entry 找到它内部那个待篡改的 vm_map_entry
     uint64_t shmemnamedentry = task_get_ipc_port_kobject(task_self(), memobj);
@@ -438,6 +447,13 @@ static polaris_vmshmem_t pr_create_shmem_with_obj(struct pr_vmobj *object) {
         mach_vm_deallocate(mach_task_self_, localaddr, roundedsize);
         return shmem;
     }
+
+    // ★ 诊断：直接读内核里 vm_named_entry 的 size 字段。
+    //   这是 vm_map.c:4155 守卫真正比对的那个值（named_entry->size），
+    //   比 entrysize 回读值更权威。有它就能一眼断定是不是"entry 太小"。
+    bool okNEs = false;
+    uint64_t namedEntrySize = pr_safe_kread64(shmemnamedentry + off_vm_named_entry_size, &okNEs);
+
     bool okBC = false, okSZ = false;
     uint64_t shmemvmcopyaddr = pr_safe_kread64(shmemnamedentry + off_vm_named_entry_backing_copy, &okBC);
     uint64_t nextaddr        = pr_safe_kread64(shmemvmcopyaddr + off_vm_named_entry_size, &okSZ);
@@ -527,8 +543,50 @@ static polaris_vmshmem_t pr_create_shmem_with_obj(struct pr_vmobj *object) {
     }
 
     mach_vm_address_t mappedaddr = 0;
-    vm_prot_t curprot = VM_PROT_ALL | VM_PROT_IS_MASK;
-    vm_prot_t maxprot = VM_PROT_ALL | VM_PROT_IS_MASK;
+
+    // ★ 关键前置校验：offset 必须落在 named entry 的范围之内。
+    //
+    // XNU vm_map.c:4155（mach_vm_map 处理 IKOT_NAMED_ENTRY 的分支）有：
+    //     if (named_entry->size < obj_offs + initial_size) {
+    //         return KERN_INVALID_ARGUMENT;
+    //     }
+    // 只要 mapOffset + mapPageSize 超出去，就会原样返回 KERN_INVALID_ARGUMENT(4)
+    // —— 正是真机日志里的错误码。
+    //
+    // 优先用从内核直接读出的 named_entry->size（它就是内核要比对的那个值）；
+    // 读不到时退回 mach_make_memory_entry_64 回读的 entrysize。
+    uint64_t limitSize = okNEs ? namedEntrySize : (uint64_t)realEntrySize;
+    if (limitSize != 0 && limitSize < mapOffset + mapPageSize) {
+        pr_set_message("映射请求超出 memory entry 范围："
+                       "namedEntrySize=0x%llx entrySize=0x%llx "
+                       "需要 0x%llx（off=0x%llx + size=0x%llx）· vmobjSize=0x%llx",
+                       (unsigned long long)(okNEs ? namedEntrySize : 0),
+                       (unsigned long long)realEntrySize,
+                       (unsigned long long)(mapOffset + mapPageSize),
+                       (unsigned long long)mapOffset,
+                       (unsigned long long)mapPageSize,
+                       (unsigned long long)roundedsize);
+        mach_vm_deallocate(mach_task_self_, localaddr, roundedsize);
+        return shmem;
+    }
+
+    // 注意：**不要**给 mach_vm_map 的 protection 参数加 VM_PROT_IS_MASK。
+    //
+    // XNU osfmk/mach/vm_prot.h：
+    //     /* Another invalid protection value.
+    //        Indicates that the other protection bits are to be applied as a
+    //        mask against the actual protection bits of the map entry. */
+    //     #define VM_PROT_IS_MASK  ((vm_prot_t) 0x40)
+    //
+    // 查过源码后确认：它**不会**导致 KERN_INVALID_ARGUMENT
+    // （vm_sanitize.c:639 的 allowed 掩码里，vm_map.c:4002 恰好把
+    //  VM_PROT_IS_MASK 作为 extra_mask 传了进去，所以能过校验）。
+    // 但语义仍是错的：置位后 vm_map.c:4141 会走
+    //     mask_cur_protection = cur_protection & VM_PROT_IS_MASK;
+    //     cur_protection &= named_entry->protection;   // 变成"取交集"
+    // 我们要的是绝对权限，所以这里如实传 VM_PROT_ALL。
+    vm_prot_t curprot = VM_PROT_ALL;
+    vm_prot_t maxprot = VM_PROT_ALL;
 
     ret = mach_vm_map(mach_task_self_, &mappedaddr, mapPageSize, 0, VM_FLAGS_ANYWHERE,
                       memobj, (memory_object_offset_t)mapOffset,
@@ -536,11 +594,12 @@ static polaris_vmshmem_t pr_create_shmem_with_obj(struct pr_vmobj *object) {
     if (ret != KERN_SUCCESS) {
         // ★ 这是最关键的诊断点：把内核返回码、以及参与映射的三个数值全报出来，
         // 这样真机日志能直接判定是「偏移越界」「权限不足」还是「memobj 无效」。
-        pr_set_message("mach_vm_map 失败：%s(0x%x) off=0x%llx size=0x%llx objsize=0x%llx",
+        pr_set_message("mach_vm_map 失败：%s(0x%x) off=0x%llx size=0x%llx objsize=0x%llx prot=0x%x",
                        mach_error_string(ret), (unsigned)ret,
                        (unsigned long long)mapOffset,
                        (unsigned long long)mapPageSize,
-                       (unsigned long long)roundedsize);
+                       (unsigned long long)roundedsize,
+                       (unsigned)curprot);
         mappedaddr = 0;
     }
 
