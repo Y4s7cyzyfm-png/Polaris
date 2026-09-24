@@ -306,7 +306,7 @@ private struct StatusCardView: View {
                     .font(.system(size: 14, weight: .semibold))
                     .foregroundStyle(statusColor)
                 Spacer()
-                Text("v0.4.6")
+                Text("v0.4.7")
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 8)

@@ -226,9 +226,9 @@ else if (ps >= 4096)  gPageShift = 12;   // ← 一旦命中，page 按 4KB 对�
 > 曾尝试「把 offset 下取整到 16KB，再用 delta 补偿页内偏移」，
 > 仿真发现 delta 较大时本地窗口会整体前移、反而覆盖不到目标地址，故弃用。
 
-### `offset` 语义歧义与阶梯重试（v0.4.6）
+### `offset` 语义歧义与二维阶梯重试（v0.4.6 → v0.4.7）
 
-v0.4.4 真机日志（`0x4` = `KERN_INVALID_ARGUMENT`）：
+#### 第一次真机（v0.4.4）：`KERN_INVALID_ARGUMENT(4)`
 
 ```
 读目标地址 0x121fc3824 失败（基址 0x118184000）
@@ -259,29 +259,110 @@ v0.4.4 真机日志（`0x4` = `KERN_INVALID_ARGUMENT`）：
    `named_entry->offset`，存在「守卫通过、随后越界被拒」的窗口；
 2. `named_entry->size` 的真实值小于 `0x9e40000`（内核偏移 `0x20` 离线不可证）。
 
-**修法：不再赌是哪一类，改成阶梯重试。**
+**修法（v0.4.6）：不再赌是哪一类，改成阶梯重试。**
 
-`pr_create_shmem_with_obj()` 现在按优先级逐个尝试 offset / size / prot 组合：
+#### 第二次真机（v0.4.6）：错误码变成 `KERN_INVALID_RIGHT(0x11)`
 
-| 档 | offset | size | prot | 精确 |
-|---|---|---|---|---|
-| 1 | `entryOffset` | 16KB | `VM_PROT_ALL` | ✅ |
-| 2 | `entryOffset - objectOffset` | 16KB | `VM_PROT_ALL` | ✅ |
-| 3 | 同档 2 | 16KB | `ALL \| IS_MASK`（Rein 原版写法） | ✅ |
-| 4 | `0`（仅当 `entryOffset == 0`） | 16KB | `VM_PROT_ALL` | ✅ |
-| 5 | `0` | `namedEntrySize` | `VM_PROT_ALL` | ❌ |
+```
+已定位 UnityFramework：base=0x13ae6c000 target=0x144cab824
+                     （偏移 0x9e3f824，页 0x144ca8000+0x3824）
+读目标地址 0x144cab824 失败（基址 0x13ae6c000）
+· mach_vm_map 全部 1 档均失败。末档 off=entryOff prot=RWX：
+  (os/kern) invalid right(0x11)
+  off=0x0 size=0x4000 objsize=0x16584000 prot=0x7
+```
+
+这条日志同时说明**两件事**，一件好一件坏。
+
+**好消息：offset 那一层已经过了。** 错误码从 `(4)` 变成
+`0x11` = 17 = `KERN_INVALID_RIGHT`，说明内核已经走到
+`vm_map.c` 更靠后的位置：
+
+```c
+/* vm_map.c:4184 / 4189 */
+if (mask_max_protection) max_protection &= named_entry->protection;
+if (mask_cur_protection) cur_protection &= named_entry->protection;
+
+if ((named_entry->protection & max_protection) != max_protection) {
+    vmlp_api_end(VM_MAP_ENTER_MEM_OBJECT, KERN_INVALID_RIGHT);
+    return KERN_INVALID_RIGHT;
+}
+if ((named_entry->protection & cur_protection) != cur_protection) {
+    vmlp_api_end(VM_MAP_ENTER_MEM_OBJECT, KERN_INVALID_RIGHT);
+    return KERN_INVALID_RIGHT;
+}
+```
+
+即 **`named_entry` 的权限不够**：我们的 entry 是 `R|W`（`0x3`），
+而 map 时请求 `prot=0x7`（`VM_PROT_ALL`），`(0x3 & 0x7) != 0x7` → 拒。
+
+**坏消息：阶梯写坏了，只生成了 1 档。** 日志里
+`全部 1 档均失败` 的「1」暴露了实现缺陷——旧版所有 offset 候选的
+生成条件都写死了 `mapOffset != 0`，而这次 `entryOffset == 0`
+（目标页恰好是 entry 的第一页），于是只剩候选 #1。
+
+> `entryOffset` 两次真机分别是 `0x9e3c000` 和 `0x0`，
+> 因为 smoba 每次启动的 `vm_map` 布局不同。这是**合法**的，
+> 也恰恰说明阶梯必须覆盖 `offset == 0`。
+
+#### v0.4.7 的两处修正
+
+**① 恢复 `VM_PROT_IS_MASK`（`0x40`）—— 它不是我 v0.4.5 以为的「冗余位」。**
+
+`VM_PROT_IS_MASK` 是 XNU 提供的**权限收敛机制**，
+`vm_map_enter_mem_object` 在检查前会执行：
+
+```c
+mask_cur_protection = cur_protection & VM_PROT_IS_MASK;
+mask_max_protection = max_protection & VM_PROT_IS_MASK;
+cur_protection &= ~VM_PROT_IS_MASK;
+max_protection &= ~VM_PROT_IS_MASK;
+```
+
+置位后 `mask_*` 非 0，于是先做 `cur_protection &= named_entry->protection`，
+把请求权限**收缩成 entry 权限的子集**，`0x7 → 0x3`，校验必然通过。
+它不影响「映射后能否读写」，只影响「请求权限怎么收敛」。
+
+**② 顺带把 `mach_make_memory_entry_64` 的 protection 提到 `VM_PROT_ALL`**
+（失败退回 `READ|WRITE`），让「请求权限 ⊆ entry 权限」恒成立。
+
+**③ 阶梯改为二维笛卡尔积**，不再依赖 `mapOffset != 0`：
+
+| 维度 | 候选 |
+|---|---|
+| offset | `O1 = entryOffset`（Rein 语义）<br>`O2 = entryOffset - objectOffset`（当 `objectOffset != 0` 且 16KB 对齐） |
+| prot | `P1 = VM_PROT_ALL \| VM_PROT_IS_MASK`（Rein 原版，**首选**）<br>`P2 = VM_PROT_ALL`<br>`P3 = VM_PROT_READ \| VM_PROT_WRITE`（下限兜底） |
+
+展开后（去重）外加一个**不精确末档**：
+
+| 场景 | 候选数 | 展开结果 |
+|---|---|---|
+| A：`entryOffset == 0` | 4 | `(O1,P1) (O1,P2) (O1,P3)` + 不精确末档 |
+| B：`entryOffset == 0x9e3c000` | 7 | 6 个精确 + 不精确末档 |
+
+两种场景下**第 1 档都是 `(off=entryOffset, prot=0x47)`**，
+与 Rein 的原始写法完全一致。
 
 失败档位在内核里**不留残留映射**，重试是零副作用的；哪一档成功会写进日志。
 
 #### 安全闸门：`exact`
 
-第 5 档虽然能让映射成功，但它指向的是**对象起始处**而非目标页。
+末档虽然能让映射成功，但它指向的是**对象起始处**而非目标页。
 `polaris_vmshmem_t` 因此新增 `exact` 字段，并贯穿页缓存：
 
 - **读路径**允许不精确映射 —— 调用方（Mach-O 探测）自带 magic 校验，读到错页会被挡掉，是「安全失败」；
 - **写路径强制要求 `exact == true`** —— 否则拒绝写入并报错。
   因为映射是共享的，写错页等于**真的改到游戏进程的对象第 0 页**，
   比直接失败严重得多。
+
+#### 诊断留痕
+
+失败信息末尾现在无条件追加 `gEntryTrace`
+（`obj / objsz / entryOff / objOff` 四个数）。原因是：
+这四个值原先只在 `pr_create_shmem_with_obj()` 里经
+`pr_set_message` 一闪而过，随后就被 `mach_vm_map` 的失败信息覆盖，
+导致下一次真机排查又得靠猜。成功时则记录 `gLastGoodLabel`
+（命中的档位编号），显示在「跨进程访问就绪 · …」那行里。
 
 ### 读取路径的分层
 
@@ -350,7 +431,7 @@ open Polaris.xcodeproj   # Xcode 16+ 打开，⌘R 运行（真机 arm64e）
 |---|---|---|
 | `Polaris/SettingsView.swift` | `telegramURL` | `https://t.me/polaris_channel` |
 | `Polaris.xcodeproj/project.pbxproj` | `PRODUCT_BUNDLE_IDENTIFIER`（Debug/Release 两处） | `com.polaris.toolkit` |
-| `codemagic.yaml` | `BUNDLE_ID` / `APP_VERSION` | `com.polaris.toolkit` / `0.4.6` |
+| `codemagic.yaml` | `BUNDLE_ID` / `APP_VERSION` | `com.polaris.toolkit` / `0.4.7` |
 
 > CI 里 `MARKETING_VERSION` 现在取 `${APP_VERSION}`（此前被硬编码成 `0.2.0`，
 > 会导致 pbxproj 里的版本号在 CI 构建时被覆盖——崩溃日志里 `app_version: 0.2.0`
@@ -394,8 +475,9 @@ Polaris/
 
 | 版本 | 变更 |
 |---|---|
-| 0.4.6 | **用「阶梯重试」取代对 `mach_vm_map` 单次调用**：v0.4.5 加的 `named_entry->size` 校验经真机数据回算后**未被触发**（`0x16584000` = 357MB ≥ 需要的 `0x9e40000` = 158MB），说明拒绝点不在尺寸上。把 `KERN_INVALID_ARGUMENT(4)` 逐条对回 `vm_map.c` 的所有分支后，剩下的候选（`named_entry->offset` 非 0 导致 `obj_offs` 二次累加；或 `named_entry->size` 真实值更小）静态无法区分，于是改为按优先级逐个尝试 offset/size/prot 组合，失败档位零副作用。新增 `polaris_vmshmem_t.exact` 安全闸门：**读路径**允许不精确映射（Mach-O magic 自校验兜底），**写路径强制要求精确**，避免退化的 `offset=0` 映射把 4 字节写到游戏对象的错误页上 |
-| 0.4.5 | **定位「(os/kern) invalid argument」的怀疑点**：v0.4.4 已证明 offset(`0x9e3c000`) 与 size(`0x4000`) 都 16KB 对齐、且远在 vm_object 之内，故「不对齐/越界」两个假设被数据否掉。错误码是 `KERN_INVALID_ARGUMENT(4)` 而非 `KERN_INVALID_ADDRESS(1)`，据此怀疑 XNU `vm_map.c` 的 `if (named_entry->size < obj_offs + initial_size)` 守卫。本次：① 回读 `mach_make_memory_entry_64` 的 in/out `entrysize`；② 直接读内核里 `vm_named_entry->size`（+0x20）作为权威上限；③ 映射前显式校验并给出可读原因；④ 去掉 `VM_PROT_IS_MASK`（查证后确认它不导致该错误码，但语义确实用错）；⑤ 失败日志追加 `prot`。**事后回算证明该守卫未触发，本版假设不成立** |
+| 0.4.7 | **修复 `(os/kern) invalid right(0x11)`，并修正 v0.4.6 阶梯的两处缺陷**。真机 v0.4.6 日志把错误码从 `KERN_INVALID_ARGUMENT(4)` 推进到 `KERN_INVALID_RIGHT(17)`——**offset/size 那层已经通过**，说明 v0.4.6 的阶梯方向对了。剩下的拒绝点是 `vm_map.c:4184/4189` 的权限子集校验：entry 是 `R\|W`(`0x3`)，map 请求 `VM_PROT_ALL`(`0x7`)，`(0x3 & 0x7) != 0x7` → 拒。**① 恢复 `VM_PROT_IS_MASK`(`0x40`) 作为首选 prot 候选**：v0.4.5 以「语义用错」为由移除它是**错的**，它其实是 XNU 的权限收敛机制（置位后内核先做 `cur_protection &= named_entry->protection`，把 `0x7` 收缩成 `0x3`），不影响「映射后能否读写」，只影响「请求权限怎么收敛」。**② `mach_make_memory_entry_64` 的 protection 提到 `VM_PROT_ALL`**（失败退回 `READ\|WRITE`），让「请求权限 ⊆ entry 权限」恒成立。**③ 阶梯从一维改为二维笛卡尔积** {`entryOffset`, `entryOffset-objectOffset`} × {`ALL\|IS_MASK`, `ALL`, `RW`}：v0.4.6 所有 offset 候选的生成条件都写死 `mapOffset != 0`，而真机这次 `entryOffset == 0`，于是只剩 1 档，正好对应日志里的「全部 1 档均失败」。**④** 失败信息末尾无条件追加 `gEntryTrace`（`obj/objsz/entryOff/objOff`），避免这四个关键数被后续 `pr_set_message` 覆盖 |
+| 0.4.6 | **用「阶梯重试」取代对 `mach_vm_map` 单次调用**：v0.4.5 加的 `named_entry->size` 校验经真机数据回算后**未被触发**（`0x16584000` = 357MB ≥ 需要的 `0x9e40000` = 158MB），说明拒绝点不在尺寸上。把 `KERN_INVALID_ARGUMENT(4)` 逐条对回 `vm_map.c` 的所有分支后，剩下的候选（`named_entry->offset` 非 0 导致 `obj_offs` 二次累加；或 `named_entry->size` 真实值更小）静态无法区分，于是改为按优先级逐个尝试 offset/size/prot 组合，失败档位零副作用。新增 `polaris_vmshmem_t.exact` 安全闸门：**读路径**允许不精确映射（Mach-O magic 自校验兜底），**写路径强制要求精确**，避免退化的 `offset=0` 映射把 4 字节写到游戏对象的错误页上。**遗留缺陷（v0.4.7 修）：阶梯写成一维且条件写死 `mapOffset != 0`，`entryOffset == 0` 时只剩 1 档** |
+| 0.4.5 | **定位「(os/kern) invalid argument」的怀疑点**：v0.4.4 已证明 offset(`0x9e3c000`) 与 size(`0x4000`) 都 16KB 对齐、且远在 vm_object 之内，故「不对齐/越界」两个假设被数据否掉。错误码是 `KERN_INVALID_ARGUMENT(4)` 而非 `KERN_INVALID_ADDRESS(1)`，据此怀疑 XNU `vm_map.c` 的 `if (named_entry->size < obj_offs + initial_size)` 守卫。本次：① 回读 `mach_make_memory_entry_64` 的 in/out `entrysize`；② 直接读内核里 `vm_named_entry->size`（+0x20）作为权威上限；③ 映射前显式校验并给出可读原因；④ 去掉 `VM_PROT_IS_MASK`；⑤ 失败日志追加 `prot`。**事后回算证明该守卫未触发，本版假设不成立**；且第 ④ 点移除 `VM_PROT_IS_MASK` 本身也是错的（v0.4.7 已恢复并说明原因） |
 | 0.4.4 | **修复「目标地址读不到内容」（41ms 秒退）**：`mach_vm_map` 的 `size` 取编译期 `PAGE_SIZE`(16KB)、`offset` 取按运行时 `pr_page_size()` 算出的 `entryOffset`，两个页大小来源不一致；当 `host_page_size()` 返回 4096 时 `offset % size != 0`，内核以 `KERN_INVALID_ADDRESS` 拒绝。改为统一用 `PR_MAP_PAGE_SIZE`(16KB)，`pr_detect_page_size()` 不再接受 4KB，并新增 `entryOffset` 的 16KB 对齐校验（不对齐直接报错，不硬凑 offset）。同时把映射失败的**真实内核返回码**透出到日志，取代原先误导性的「映像可能未加载」 |
 | 0.4.3 | **修复「未找到 UnityFramework 映像」（36ms 秒退）**：根因是 `ds_kread*`/`ds_kwrite*` 只认内核地址，而 UnityFramework 基址与内透目标都是 smoba 用户态地址，被 `ds_isvalid` 全数拒掉。新增 `remotepage.{h,m}` 跨进程访问层——移植 Rein `TaskRop/vm.m` 的 **vm_object 共享映射**（vtop 在 iOS 18.6 上语义不符，已排除），把目标页映射进本进程后用 `memcpy` 读写；读取路径按目标分成 `up_safe_kread*`（内核对象）/ `up_user_read*`（smoba 用户态）两层；内透写入改走 `up_user_write()` 而非 `ds_kwrite32`；定位前先 `polaris_remote_set_target(vmMap)` 登记目标进程，开启/关闭路径带自愈重登记 |
 | 0.4.2 | **修复内透定位到错误基址**：去掉「校验失败时退回体积最大条目」的危险兜底（smoba 有个 ~9.8GB 匿名映射，体积碾压 UnityFramework 的 280MB，导致基址错到 `0x274000000`）；阶段 1 增加页对齐筛选，候选上限提到 64 且不再按体积裁剪；排序改为「特征区间 → 合理库大小（≤2GB）→ 体积降序」；新增基址/目标地址的最终窗口闸门，越界即放弃 |
