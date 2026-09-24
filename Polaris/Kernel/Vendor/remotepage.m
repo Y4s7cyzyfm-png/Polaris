@@ -167,15 +167,29 @@ static uint64_t pr_page_size(void) {
     return (uint64_t)1 << (gPageShift ? gPageShift : 14);
 }
 
+/// 映射这一层**始终**使用 16KB 粒度。
+///
+/// 原因：`VME_OFFSET(x) = x << 12` 已经是 4KB 单位，而 arm64 iOS 的
+/// vm_object / vm_map 都以 16KB 对齐；`mach_vm_map` 又要求 offset 是
+/// size 的整数倍。若这里跟着运行时的 4KB 走，就会出现
+/// 「size=16KB 而 offset 只按 4KB 对齐」→ 内核直接 KERN_INVALID_ADDRESS。
+///
+/// 所以映射粒度固定 16KB，与编译期 PAGE_SIZE 保持一致，
+/// 消除「两个页大小来源打架」这个隐患。
+#define PR_MAP_PAGE_SIZE  ((uint64_t)0x4000)
+
 /// 探测页大小。iPhone 13,4（A14）为 16KB；老设备 4KB。
+///
+/// 注意：iOS 上 host_page_size() 返回的可能是 4096（部分虚拟化/兼容路径），
+/// 但映射层必须按 16KB 走，因此这里**只接受 >= 16KB 的结果**，
+/// 更小的值一律提升到 16KB，保证与 PR_MAP_PAGE_SIZE 自洽。
 static void pr_detect_page_size(void) {
     if (gPageShift != 0) return;
     vm_size_t ps = 0;
-    if (host_page_size(mach_host_self(), &ps) == KERN_SUCCESS && ps > 0) {
-        if (ps >= 16384)     gPageShift = 14;
-        else if (ps >= 4096) gPageShift = 12;
+    if (host_page_size(mach_host_self(), &ps) == KERN_SUCCESS && ps >= 16384) {
+        gPageShift = 14;
     }
-    if (gPageShift == 0) gPageShift = 14; // 兜底 16KB
+    if (gPageShift == 0) gPageShift = 14; // 统一 16KB
 }
 
 // ---------------------------------------------------------------------------
@@ -307,7 +321,8 @@ static struct pr_vmobj pr_vm_get_object(uint64_t vmMap, uint64_t address) {
 
     uint64_t entryaddr = pr_vmmap_find_entry(vmMap, address);
     if (!entryaddr) {
-        pr_set_message("目标页不在任何 vm_map 条目内（0x%llx）", address);
+        pr_set_message("目标页不在任何 vm_map 条目内（0x%llx）",
+                       (unsigned long long)address);
         return result;
     }
 
@@ -326,7 +341,7 @@ static struct pr_vmobj pr_vm_get_object(uint64_t vmMap, uint64_t address) {
     uint64_t entryoffs = address - entry.links.start + objoffs;
 
     if (!pr_kok(vmeobj)) {
-        pr_set_message("解出的 vm_object 指针无效（0x%llx）", vmeobj);
+        pr_set_message("解出的 vm_object 指针无效（0x%llx）", (unsigned long long)vmeobj);
         return result;
     }
 
@@ -361,7 +376,8 @@ static polaris_vmshmem_t pr_create_shmem_with_obj(struct pr_vmobj *object) {
     uint64_t size = pr_safe_kread64(object->address + off_vm_object_vo_un1_vou_size, &okSize);
     if (!okSize) {
         pr_set_message("读取 vm_object 大小失败 (obj=0x%llx off=0x%x)",
-                       object->address, off_vm_object_vo_un1_vou_size);
+                       (unsigned long long)object->address,
+                       off_vm_object_vo_un1_vou_size);
         return shmem;
     }
     size = pr_round_page(size);
@@ -486,20 +502,45 @@ static polaris_vmshmem_t pr_create_shmem_with_obj(struct pr_vmobj *object) {
     }
 
     // 7) 把这一页映射进本进程
+    //
+    // ★ 这里必须让 size 与 offset 出自**同一个页大小**。
+    // 之前的写法是 size 用编译期 PAGE_SIZE(16384)、offset 用 entryOffset
+    // （它是按运行时 pr_page_size() 算出来的），两者粒度一旦不一致，
+    // 内核会以 KERN_INVALID_ADDRESS 拒绝——这正是 41ms 就失败的原因。
+    // 现在两边都统一取 PR_MAP_PAGE_SIZE。
+    const uint64_t mapPageSize = PR_MAP_PAGE_SIZE;
+    uint64_t mapOffset = object->entryOffset;
+
+    // entryOffset = (page - entry.start) + (vme_offset << 12)。
+    // 前者因 page 与 entry.start 都页对齐而是 16KB 的倍数；
+    // 后者只有在 vme_offset 为 4 的倍数时才是。普通 Mach-O __TEXT
+    // 的 vme_offset 恒为 0，所以正常情况下一定对齐。
+    //
+    // 万一不对齐，说明这个 entry 并非「对象从段首开始」的常规情形，
+    // 硬凑 offset 会读到错位字节——那比直接失败更糟。所以这里明确报错。
+    if (mapOffset & (mapPageSize - 1)) {
+        pr_set_message("entryOffset 0x%llx 未按 16KB 对齐（vme_offset 非 4 的倍数？），"
+                       "拒绝映射以免读到错位数据",
+                       (unsigned long long)mapOffset);
+        mach_vm_deallocate(mach_task_self_, localaddr, roundedsize);
+        return shmem;
+    }
+
     mach_vm_address_t mappedaddr = 0;
     vm_prot_t curprot = VM_PROT_ALL | VM_PROT_IS_MASK;
     vm_prot_t maxprot = VM_PROT_ALL | VM_PROT_IS_MASK;
 
-    ret = mach_vm_map(mach_task_self_, &mappedaddr, PAGE_SIZE, 0, VM_FLAGS_ANYWHERE,
-                      memobj, (memory_object_offset_t)object->entryOffset,
+    ret = mach_vm_map(mach_task_self_, &mappedaddr, mapPageSize, 0, VM_FLAGS_ANYWHERE,
+                      memobj, (memory_object_offset_t)mapOffset,
                       false /* copy = FALSE */, curprot, maxprot, VM_INHERIT_NONE);
     if (ret != KERN_SUCCESS) {
         // ★ 这是最关键的诊断点：把内核返回码、以及参与映射的三个数值全报出来，
         // 这样真机日志能直接判定是「偏移越界」「权限不足」还是「memobj 无效」。
-        pr_set_message("mach_vm_map 失败：%s(0x%x) off=0x%llx pagesz=%llu",
+        pr_set_message("mach_vm_map 失败：%s(0x%x) off=0x%llx size=0x%llx objsize=0x%llx",
                        mach_error_string(ret), (unsigned)ret,
-                       (unsigned long long)object->entryOffset,
-                       (unsigned long long)PAGE_SIZE);
+                       (unsigned long long)mapOffset,
+                       (unsigned long long)mapPageSize,
+                       (unsigned long long)roundedsize);
         mappedaddr = 0;
     }
 
@@ -528,8 +569,10 @@ polaris_vmshmem_t polaris_vmmap_remote_page(uint64_t vmMap, uint64_t address) {
 
 void polaris_vm_unmap_local(uint64_t localAddress, uint64_t size) {
     if (!localAddress) return;
+    // 兜底用 PR_MAP_PAGE_SIZE，与映射时使用的粒度一致，
+    // 避免这里按 4KB 释放而留下未回收的映射。
     mach_vm_deallocate(mach_task_self_, (mach_vm_address_t)localAddress,
-                       size ? size : PAGE_SIZE);
+                       size ? size : PR_MAP_PAGE_SIZE);
 }
 
 // ---------------------------------------------------------------------------
@@ -605,6 +648,9 @@ static void pr_page_cache_put(uint64_t remotePage, uint64_t localPage) {
 /// 于是到上层只剩一句笼统的话。这里把第一次失败的完整原因单独留存。
 static char gFirstFailDetail[192] = {0};
 
+/// 把远程一页映射进本进程。
+/// @param remotePage 目标进程里的页首地址（按 pr_page_size() 对齐）
+/// @return 本地页首地址（与 remotePage 一一对应）；0 表示失败
 static uint64_t pr_map_remote_page(uint64_t remotePage) {
     uint64_t local = pr_page_cache_get(remotePage);
     if (local) return local;
