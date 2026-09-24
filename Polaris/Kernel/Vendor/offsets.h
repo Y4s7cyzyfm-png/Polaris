@@ -109,6 +109,7 @@ extern uint32_t off_vm_object_ref_count;
 extern uint32_t off_vm_named_entry_backing_copy;
 extern uint32_t off_vm_named_entry_size;
 extern uint32_t off_vm_named_entry_offset;
+extern uint32_t off_vm_map_cs_bits;
 extern uint32_t off_label_l_perpolicy_amfi;
 extern uint32_t off_label_l_perpolicy_sandbox;
 

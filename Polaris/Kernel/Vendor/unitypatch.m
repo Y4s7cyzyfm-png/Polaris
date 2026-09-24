@@ -40,6 +40,9 @@
 #import "remotepage.h"
 #import "utils.h"
 
+#import <mach/mach.h>
+#import <mach/mach_host.h>
+
 // ---------------------------------------------------------------------------
 // Mach-O 常量（内核侧读取，不依赖 <mach-o/loader.h> 的平台头）
 // ---------------------------------------------------------------------------
@@ -120,6 +123,21 @@ static void up_set_message(const char *fmt, ...) {
 
 static inline bool up_is_user_pointer(uint64_t p) {
     return p >= UP_IMAGE_MIN && p < UP_IMAGE_MAX;
+}
+
+/// 运行期页大小（iOS 16+ 的 arm64 真机是 16KB）。
+/// 只用于「把读取请求按页切分」，不参与任何地址计算 ——
+/// 写死 0x1000 会让同一个 16KB 页被映射/查表 4 次，纯浪费。
+static size_t up_page_size(void) {
+    static size_t cached = 0;
+    if (cached == 0) {
+        size_t ps = 0;
+        if (host_page_size(mach_host_self(), &ps) != KERN_SUCCESS || ps == 0) {
+            ps = 0x4000;
+        }
+        cached = ps;
+    }
+    return cached;
 }
 
 /// 整段 [addr, addr+len) 是否落在同一 4K 页内。
@@ -212,6 +230,16 @@ static bool up_user_read(uint64_t addr, void *buf, size_t len) {
     // 溢出保护：addr + len 不能越过映像窗口上界
     if (addr + (uint64_t)len < addr) return false;
     if (addr + (uint64_t)len > UP_IMAGE_MAX) return false;
+    // ★ 单次读不得超过一页。
+    //
+    // remotepage 的跨页分支会把请求从页首重新发起：
+    //   polaris_remote_read(vaddr, out, len) 在 off+len > ps 时先读
+    //   (vaddr, first) 再读 (vaddr+first, len-first)，而第二次映射算出的
+    //   页内偏移是错的。
+    // 一旦调用方传入跨页长度，读回的就是**另一页**的内容 ——
+    // 表现为「回读值不等于刚写进去的值」而误报写失败。
+    // 这里统一拦成一页以内，超长由调用方自己分段。
+    if (len > up_page_size()) return false;
 
     return polaris_remote_read(addr, buf, len);
 }
@@ -222,6 +250,7 @@ static bool up_user_write(uint64_t addr, const void *src, size_t len) {
     if (!up_is_user_pointer(addr)) return false;
     if (addr + (uint64_t)len < addr) return false;
     if (addr + (uint64_t)len > UP_IMAGE_MAX) return false;
+    if (len > up_page_size()) return false;   // 同 up_user_read，禁止跨页
 
     return polaris_remote_write(addr, src, len);
 }
@@ -233,11 +262,19 @@ static uint64_t up_user_read64(uint64_t addr, bool *ok) {
     return r ? v : 0;
 }
 
-static uint32_t up_user_read32(uint64_t addr, bool *ok) {
-    uint32_t v = 0;
-    bool r = up_user_read(addr, &v, sizeof(v));
-    if (ok) *ok = r;
-    return r ? v : 0;
+/// 读一条 AArch64 指令（整字读回，取低 32 位）。
+///
+/// 指令必然 4 字节对齐，不可能跨越页边界，所以「整字读」在这里天然等价
+/// 于一次原子读。反过来，用 4 字节读去校验 16KB 页上的指令时，
+/// remotepage 的跨页分支（off + len > ps）会把请求拆成两次映射，
+/// 第二次拿到的是错页 —— 回读校验会**假失败**。
+static bool up_user_read_insn(uint64_t addr, uint32_t *out) {
+    if (!out) return false;
+    if (addr & 0x3) return false;          // 指令必须 4 字节对齐
+    uint64_t v = 0;
+    if (!up_user_read(addr, &v, sizeof(v))) return false;
+    *out = (uint32_t)(v & 0xFFFFFFFFu);
+    return true;
 }
 
 /// 读取用户态内存里的 C 字符串（逐页分段，不要求同页）。
@@ -251,7 +288,10 @@ static bool up_user_readstr(uint64_t addr, char *out, size_t outSize) {
         size_t room = outSize - 1 - got;
         size_t chunk = 64;
         // 限本页内（remotepage 自己能跨页，但按页切更省映射）
-        size_t pageLeft = 0x1000 - (size_t)(cur & 0xFFF);
+        // ★ 别写死 0x1000：16KB 页机器上按 4KB 切会让同一个页
+        //   被映射/查表 4 次。用运行期页大小。
+        size_t pageSize = up_page_size();
+        size_t pageLeft = pageSize - (size_t)(cur & (pageSize - 1));
         if (chunk > pageLeft) chunk = pageLeft;
         if (chunk > room) chunk = room;
         if (chunk == 0) break;
@@ -341,16 +381,18 @@ static bool up_probe_macho(uint64_t base, uint32_t *outFileType,
     uint64_t lc = base + 0x20; // 64 位 Mach-O 头大小
     uint32_t limit = (ncmds < UP_MAX_LC) ? ncmds : UP_MAX_LC;
     for (uint32_t i = 0; i < limit; i++) {
-        uint32_t cmd = 0, cmdsize = 0;
-        bool ok1 = false, ok2 = false;
-        cmd     = up_user_read32((uint64_t)lc, &ok1);
-        cmdsize = up_user_read32((uint64_t)lc + 4, &ok2);
-        if (!ok1 || !ok2) break;
+        // lc_command 的 cmd/cmdsize 是相邻两个 uint32，整字读一次拿全，
+        // 既少一次映射，也避免两个字段来自不同页。
+        uint64_t hdr = 0;
+        if (!up_user_read((uint64_t)lc, &hdr, sizeof(hdr))) break;
+        uint32_t cmd     = (uint32_t)(hdr & 0xFFFFFFFFu);
+        uint32_t cmdsize = (uint32_t)(hdr >> 32);
         if (cmdsize < 8 || cmdsize > 0x10000) break;
 
         if (cmd == LC_ID_DYLIB) {
             // dylib_command: cmd, cmdsize, dylib.name.offset (uint32 @ +8)
-            uint32_t nameoff = up_user_read32((uint64_t)lc + 8, NULL);
+            uint32_t nameoff = 0;
+            if (!up_user_read((uint64_t)lc + 8, &nameoff, sizeof(nameoff))) break;
             if (nameoff > 8 && nameoff < cmdsize) {
                 char buf[256] = {0};
                 size_t want = sizeof(buf) - 1;
@@ -617,6 +659,135 @@ uint64_t polaris_find_unity_framework_base(void) {
 }
 
 // ---------------------------------------------------------------------------
+// codesign 保险：给 smoba 的 vm_map 放行「失效页」
+// ---------------------------------------------------------------------------
+//
+// ★ 为什么需要这一步（v0.5.0 真机崩溃的根因）
+//
+// 目标页位于 UnityFramework 的 __TEXT 段，是**已签名**的代码页。
+// 我们通过 vm_object 共享映射把这一页写脏之后，XNU 的 VM 会在页上记两笔账：
+//
+//   1) vmp_wpmapped —— 该页曾被「以可写方式映射进某个 pmap」；
+//   2) vmp_dirty     —— 页内容已被改过。
+//
+// 之后 smoba 自己只要再碰这一页（哪怕只是读一个放在该页里的常量，
+// 或重新执行到该页的指令），就会走 vm_fault_enter()。那里出现：
+//
+//   if (cs_enforcement_enabled) {
+//       ...
+//       else if (vm_fault_cs_page_immutable(m, ..., prot) &&
+//                ((prot & VM_PROT_WRITE) || m->vmp_wpmapped)) {
+//           *cs_violation = TRUE;      // ← 中文注释：page 有被动过的风险
+//       }
+//   }
+//   → vm_fault_cs_handle_violation() → cs_invalid_page(vaddr, &cs_killed)
+//
+// cs_invalid_page()（bsd/kern/kern_cs.c）里只认 proc 的 csflags：
+//
+//   if (flags & CS_KILL) { flags |= CS_KILLED; send_kill = 1; retval = 1; }
+//   ...
+//   if (send_kill) threadsignal(current_thread(), SIGKILL, EXC_BAD_ACCESS, FALSE);
+//
+// smoba 是平台二进制，csflags 带 CS_KILL，于是它收到 SIGKILL，
+// 崩溃报告里写的就是我们见到的那三行：
+//   termination = { namespace: CODESIGNING, code: 2, indicator: "Invalid Page" }
+//   ktriageinfo = "VM - (arg = 0x0) CL - "   （CL = CodeSigning）
+//   崩溃地址落在 UnityFramework __TEXT 区间内，且与补丁点同页
+//
+// 官方给「故意改自己代码」这种场景留了后门，就是 cs_allow_invalid()
+// （同一个文件，cs_allow_invalid() 尾部）：
+//
+//     proc_csflags_update(p, flags & ~(CS_KILL | CS_HARD));
+//     ...
+//     vm_map_switch_protect(get_task_map(proc_task(p)), FALSE);
+//     vm_map_cs_debugged_set(get_task_map(proc_task(p)), TRUE);
+//
+// 也就是往 vm_map 里落两个布尔字段：cs_debugged=true、switch_protect=false。
+// 我们直接把这俩字段写进 smoba 的 vm_map，作用等价于「让系统认为
+// smoba 是被调试的进程」，cs_invalid_page() 收到 CS_KILL 就会放行而不是击杀。
+//
+// 参考 XNU main：
+//   osfmk/vm/vm_map.h      struct vm_map { ... boolean_t cs_debugged:1;
+//                                          boolean_t switch_protect:1; ... }
+//   bsd/kern/kern_cs.c     cs_invalid_page() / cs_allow_invalid()
+//   osfmk/vm/vm_fault.c    vm_fault_cs_check_violation() / vm_fault_cs_handle_violation()
+
+/// 已成功给 smoba 的 vm_map 落过保险
+static bool gCsRelaxed = false;
+
+/// `struct _vm_map` 里那个 `unsigned int` 位域字的位置与掩码。
+///
+/// 依据 XNU `osfmk/vm/vm_map_xnu.h` 的 `struct _vm_map`：
+///
+/// ```c
+/// unsigned int
+///     wait_for_space:1, wiring_required:1, no_zero_fill:1, mapped_in_other_pmaps:1,
+///     switch_protect:1,            /* bit 4  */
+///     disable_vmentry_reuse:1, map_disallow_data_exec:1, holelistenabled:1,
+///     is_nested_map:1, map_disallow_new_exec:1, jit_entry_exists:1, has_corpse_footprint:1,
+///     terminated:1, is_alien:1, cs_enforcement:1,
+///     cs_debugged:1,               /* bit 15 */
+///     ...
+/// ```
+///
+/// **注意这两个位在同一个 32 位字里**（bit 4 与 bit 15），
+/// 不是相邻的两个字节 —— 必须读-改-写整个字，否则会踩坏
+/// `wait_for_space` .. `cs_enforcement` 这一整片标志位。
+#define UP_VMMAP_BITS_MASK_SWITCH_PROTECT   (1u << 4)    /* 0x00000010 */
+#define UP_VMMAP_BITS_MASK_CS_DEBUGGED      (1u << 15)   /* 0x00008000 */
+
+/// 给目标进程的 vm_map 落 cs_debugged / switch_protect，放行「被写脏的代码页」。
+///
+/// @return 是否两个位都写成功。
+static bool up_relax_target_codesign(void) {
+    if (gCsRelaxed) return true;
+    if (!ds_is_ready()) return false;
+    if (off_vm_map_cs_bits == 0) {
+        // 偏移表没初始化（老设备分支）。不用慌，只是少了这层保险，
+        // 仍然继续写入 —— 内透本身是可用的，只是崩溃风险回升。
+        return false;
+    }
+
+    uint64_t proc = proc_find_by_name(POLARIS_GAME_PROCESS_NAME);
+    if (!proc || !ds_isvalid(proc)) return false;
+
+    uint64_t task = proc_task(proc);
+    if (!task || !ds_isvalid(task)) return false;
+
+    uint64_t vmMap = task_get_vm_map(task);
+    if (!vmMap || !ds_isvalid(vmMap)) return false;
+
+    // 位域字基址：vm_map + off_vm_map_hdr + off_vm_map_cs_debugged
+    // （off_vm_map_hdr = 0x10 落在 vm_map_header，off_vm_map_cs_bits = 0x80
+    //   是位域字相对 header 的偏移，合起来 = 0x90）
+    uint64_t bitsAddr = vmMap + off_vm_map_hdr + off_vm_map_cs_bits;
+
+    bool okResult = false;
+    @try {
+        // ★ 读-改-写：cs_debugged 置 1、switch_protect 清 0，其余位原样保留。
+        // 分两次写同一地址的不同字节是错的 —— 它们同属一个 32 位字。
+        uint32_t bits = ds_kread32(bitsAddr);
+        uint32_t want = (bits | UP_VMMAP_BITS_MASK_CS_DEBUGGED)
+                      & ~UP_VMMAP_BITS_MASK_SWITCH_PROTECT;
+        if (bits != want) {
+            ds_kwrite32(bitsAddr, want);
+        }
+        uint32_t back = ds_kread32(bitsAddr);
+        okResult = (back & UP_VMMAP_BITS_MASK_CS_DEBUGGED) != 0 &&
+                   (back & UP_VMMAP_BITS_MASK_SWITCH_PROTECT) == 0;
+    }
+    @catch (NSException *e) {
+        (void)e;   // 读失败就当没落上，不抛到 Swift 边界（会 SIGABRT）
+    }
+    @catch (...) {
+    }
+
+    // 只有真的生效才算数：写失败时 smoba 仍可能被击杀，别谎报。
+    gCsRelaxed = okResult;
+    return gCsRelaxed;
+}
+
+// ---------------------------------------------------------------------------
 // 内透开关
 // ---------------------------------------------------------------------------
 
@@ -653,9 +824,8 @@ bool polaris_enable_transparent_wall(void) {
 
     // 备份原始指令（只备份一次，重复开启不会覆盖真原始值）
     if (!gHaveBackup) {
-        bool ok = false;
-        uint32_t current = up_user_read32(gTargetAddr, &ok);
-        if (!ok) {
+        uint32_t current = 0;
+        if (!up_user_read_insn(gTargetAddr, &current)) {
             // 把 remotepage 记录的**真实失败原因**带出来，
             // 否则只能瞎猜「映像未加载」——上一版就是这么误判的。
             char why[1024] = {0};
@@ -674,10 +844,29 @@ bool polaris_enable_transparent_wall(void) {
         gHaveBackup = true;
     }
 
-    if (!gHaveBackup) {
-        up_set_message("缺少原始指令备份，已中止写入");
-        return false;
+    // ---- 幂等：已是补丁值就不要再写 -------------------------------------
+    //
+    // 目标页属于**已签名的 __TEXT**。页一旦被写过，VM 就会把它标记成
+    // 可疑页，之后 smoba 若因任何原因重新走一遍该页的冲突处理，
+    // cs_invalid_page() 就会按 CODESIGNING/Invalid Page 直接 SIGKILL 进程。
+    // 每多写一次就多一次风险，所以这里先读一遍：值已经对了就什么都不做。
+    uint32_t currentInsn = 0;
+    if (up_user_read_insn(gTargetAddr, &currentInsn) &&
+        currentInsn == UNITY_PATCH_VALUE) {
+        // 即便不写也要把保险补上：上一次进程可能已重启过。
+        bool relaxed = up_relax_target_codesign();
+        gEnabled = true;
+        up_set_message("内透已开启（该页本就是补丁值）· 0x%llx · %s",
+                       (unsigned long long)gTargetAddr,
+                       relaxed ? "codesign 保险已就位" : "codesign 保险未落上");
+        return true;
     }
+
+    // ★ 写之前先落 codesign 保险。
+    // 单独写这一步是**不够**的（cs_killed 的判定在页状态上，写脏之后
+    // smoba 再碰这一页仍会走到 cs_invalid_page），但写完之后 smoba
+    // 立刻就会重新执行到这条指令 —— 只有先放了保险，那次冲突才不会被判死。
+    bool relaxed = up_relax_target_codesign();
 
     // ★ 写入走 vm_object 共享映射（目标页已映射进本进程），不是 ds_kwrite32。
     // ds_kwrite32 只认内核地址，写用户态地址会被 ds_isvalid 拒掉。
@@ -689,10 +878,11 @@ bool polaris_enable_transparent_wall(void) {
         return false;
     }
 
-    // 回读校验：写不生效时不要谎报成功
-    bool okV = false;
-    uint32_t verify = up_user_read32(gTargetAddr, &okV);
-    if (!okV || verify != UNITY_PATCH_VALUE) {
+    // 回读校验：写不生效时不要谎报成功。
+    // 必须整字（8 字节）读回，不能用 4 字节 —— remotepage 的跨页分支
+    // 会把 4 字节读拆成两次映射，第二次拿到错页，于是假失败。
+    uint32_t verify = 0;
+    if (!up_user_read_insn(gTargetAddr, &verify) || verify != UNITY_PATCH_VALUE) {
         gEnabled = false;
         up_set_message("内透写入未生效（回读 0x%08X，期望 0x%08X）",
                        verify, UNITY_PATCH_VALUE);
@@ -700,8 +890,11 @@ bool polaris_enable_transparent_wall(void) {
     }
 
     gEnabled = true;
-    up_set_message("内透已开启 · 0x%llx（原值 0x%08X → 0x%08X）",
-                   (unsigned long long)gTargetAddr, gOriginalInstruction, UNITY_PATCH_VALUE);
+    // 日志里明确标出 cs_debugged 是否落上 —— 它决定 smoba 会不会被击杀，
+    // 是这一版最需要真机确认的一个开关。
+    up_set_message("内透已开启 · 0x%llx（原值 0x%08X → 0x%08X）· %s",
+                   (unsigned long long)gTargetAddr, gOriginalInstruction, UNITY_PATCH_VALUE,
+                   relaxed ? "codesign 保险已就位" : "codesign 保险未落上（偏移表缺失或写入被拒）");
     return true;
 }
 
@@ -725,6 +918,18 @@ bool polaris_disable_transparent_wall(void) {
         return false;
     }
 
+    // 已是原值就不要再写，理由同开启路径：每次写入都会把目标页标成
+    // cs_tainted，写越少越不容易触发 codesign 击杀。
+    uint32_t currentInsn = 0;
+    if (up_user_read_insn(gTargetAddr, &currentInsn) &&
+        currentInsn == gOriginalInstruction) {
+        gEnabled = false;
+        polaris_remote_flush_cache();   // 不写也必须放开本地映射引用
+        up_set_message("内透已关闭（该页本就是原值）· 0x%llx",
+                       (unsigned long long)gTargetAddr);
+        return true;
+    }
+
     if (!up_user_write(gTargetAddr, &gOriginalInstruction, sizeof(gOriginalInstruction))) {
         char detail[1024] = {0};
         polaris_remote_describe(detail, (int)sizeof(detail));
@@ -735,9 +940,8 @@ bool polaris_disable_transparent_wall(void) {
     // 回读校验还原结果。注意：目标页可能已被游戏重新映射（换了 vm_object），
     // 所以「读失败」不算还原失败——写已经发出去了，读不到只是映射变了。
     // 只有「读到了但值不对」才报错。
-    bool okV = false;
-    uint32_t verify = up_user_read32(gTargetAddr, &okV);
-    if (okV && verify != gOriginalInstruction) {
+    uint32_t verify = 0;
+    if (up_user_read_insn(gTargetAddr, &verify) && verify != gOriginalInstruction) {
         up_set_message("内透还原未生效（回读 0x%08X，期望 0x%08X）",
                        verify, gOriginalInstruction);
         return false;

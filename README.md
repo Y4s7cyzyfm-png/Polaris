@@ -677,6 +677,157 @@ if (namedEntrySize < needSize)
 **第 1 档就会命中且是精确偏移** —— 内透读写将落到正确页面上。
 
 
+#### v0.5.0：内透通了，但 smoba 被 codesign 击杀
+
+v0.4.9 的真机日志证明**读写链路完全打通**：
+
+```
+12:33:58.221 stage: 正在定位 UnityFramework
+12:33:58.277 stage: 内透已开启 · 0x1387c3824（原值 0xAA1803E1 → 0xD2800021）
+12:33:58.277 transparent wall ready — base=0x12e984000 target=0x1387c3824
+```
+
+`base = 0x12e984000`、`target = 0x1387c3824`，差值正好 `0x9e3f824` ✅。
+原值 `0xAA1803E1`（`MOV W1, #0x3F08` 之类）被换成 `0xD2800021`，
+回读校验也通过 —— **v0.4.9 的修复成立**。
+
+但约 10 秒后 smoba 崩溃：
+
+```
+termination : {"flags":2,"code":2,"namespace":"CODESIGNING","indicator":"Invalid Page"}
+subtype     : KERN_PROTECTION_FAILURE at 0x00000001387c0810
+ktriageinfo : "VM - (arg = 0x0) CL - "
+vmRegionInfo: 0x1387c0810 is in 0x12e984000-0x14021c000
+              ---> __TEXT ... r-x/rwx SM=COW .../UnityFramework
+```
+
+##### 崩溃地址与补丁点同页
+
+| | 地址 | 所在 16KB 页 | 页内偏移 |
+|---|---|---|---|
+| 补丁点 | `0x1387c3824` | `0x1387c0000` | `0x3824` |
+| 崩溃点 | `0x1387c0810` | `0x1387c0000` | `0x0810` |
+
+同属一页，`vmRegionInfo` 也确认它落在 UnityFramework 的 `__TEXT`
+（`r-x/rwx SM=COW`，280.6M）。这不是巧合 —— 是我们写过的那一页。
+
+##### 机制：`cs_invalid_page()` 按 `CS_KILL` 直接 SIGKILL
+
+链条全部来自 XNU 源码，逐段可查：
+
+1. **我们写脏了一页已签名的代码页。** 目标页属于 UnityFramework 的
+   `__TEXT`，是 `SM=COW` 的签名代码。经 vm_object 共享映射写入后，
+   VM 在这一页上记下 `vmp_wpmapped = 1`（曾被以可写方式映射进 pmap）
+   与 `vmp_dirty = 1`。
+
+2. **smoba 再次碰到这一页时走 `vm_fault_enter()`**，命中这条分支
+   （`osfmk/vm/vm_fault.c`）：
+
+   ```c
+   else if (vm_fault_cs_page_immutable(m, ..., prot) &&
+            ((prot & VM_PROT_WRITE) || m->vmp_wpmapped)) {
+       /* 该页本应不可变，却有被改动的风险 */
+       *cs_violation = TRUE;
+   }
+   ```
+
+   随即 `vm_fault_cs_handle_violation()` → `cs_invalid_page(vaddr, &cs_killed)`。
+
+3. **`cs_invalid_page()`（`bsd/kern/kern_cs.c`）只认 proc 的 csflags：**
+
+   ```c
+   if (flags & CS_KILL) { flags |= CS_KILLED; send_kill = 1; retval = 1; }
+   ...
+   if (send_kill) threadsignal(current_thread(), SIGKILL, EXC_BAD_ACCESS, FALSE);
+   ```
+
+   smoba 是平台二进制，csflags 带 `CS_KILL` → 收 `SIGKILL`。
+   这份崩溃报告里的 `namespace: CODESIGNING` / `indicator: "Invalid Page"`
+   就是第 2 步 `os_reason_create(OS_REASON_CODESIGNING,
+   CODESIGNING_EXIT_REASON_INVALID_PAGE)` 写下的。
+
+##### 官方后门：`cs_allow_invalid()`
+
+同一个文件里，Apple 给「故意改自己代码」这种场景留了出口：
+
+```c
+/* bsd/kern/kern_cs.c, cs_allow_invalid() 尾部 */
+proc_csflags_update(p, flags & ~(CS_KILL | CS_HARD));
+...
+vm_map_switch_protect(get_task_map(proc_task(p)), FALSE);
+vm_map_cs_debugged_set(get_task_map(proc_task(p)), TRUE);
+```
+
+也就是往 `vm_map` 里落两个布尔字段：
+
+| 字段 | 目标值 | 作用 |
+|---|---|---|
+| `cs_debugged` | `true` | `cs_allow_invalid()` 之后清掉 `CS_KILL`/`CS_HARD` 的结果位 |
+| `switch_protect` | `false` | 关掉「切换映射时保护不可变页」那一路 |
+
+**修法（v0.5.0）**：不调用内核函数，直接把这俩位写进 smoba 的 `vm_map`。
+
+```c
+uint64_t bitsAddr = vmMap + off_vm_map_hdr + off_vm_map_cs_bits;  // vmMap + 0x90
+uint32_t bits = ds_kread32(bitsAddr);
+uint32_t want = (bits | 0x00008000)   // cs_debugged = 1     (bit 15)
+                      & ~0x00000010;  // switch_protect = 0  (bit 4)
+ds_kwrite32(bitsAddr, want);
+```
+
+新增 `off_vm_map_cs_bits = 0x80`（相对 `vm_map_header` 的偏移，绝对位置
+`vmMap + 0x10 + 0x80 = vmMap + 0x90`），与既有 `off_vm_map_header_links_next = 0x08`
+/ `off_vm_map_header_nentries = 0x20` 的用法与编码风格一致 —— 这三个偏移
+都是「相对 hdr」的，已交叉校验（`0x10 + 0x08 = 0x18` ✅、`0x10 + 0x20 = 0x30` ✅、
+`0x10 + 0x80 = 0x90` ✅）。
+
+> ⚠️ **踩坑记录（记录以免重犯）**：最初按字面把这两个字段当成
+> 「相邻的两个字节」写成 `+0x98` / `+0x99` 并分两次 `ds_kwrite32`，
+> **完全错误**。它们其实位于**同一个 32 位字**里（bit 4 与 bit 15），
+> 必须**读-改-写整个字**，否则会踩坏 `wait_for_space` .. `cs_enforcement`
+> 之间的十几个标志位。
+>
+> 实测方法：构造 `struct _vm_map` 后置位再回读那个 32 位字 ——
+> `switch_protect=1` 得到 `0x00000010`（bit 4），
+> `cs_debugged=1` 得到 `0x00008000`（bit 15），
+> 且两次都在偏移 `0x90` 的同一个字里。
+
+##### 顺带修掉的两个真 bug
+
+**① 4 字节回读会读到错页（会导致「写成功却报失败」）**
+
+`remotepage.m` 的 `polaris_remote_read()` 在 `off + len > ps` 时会
+「从页首重新发起」把请求拆成两段，而第二段的页内偏移是按**映射粒度**
+重算的 —— 简化处理会让第二段落到**另一页**。目标地址
+`0x1387c3824` 在 16KB 页里偏移 `0x3824 = 14372`，`14372 + 4 > 16384`，
+**恰好越过页尾**，于是 4 字节读会被拆成两次映射，第二次读回的是下一页。
+
+v0.5.0 改成**整字（8 字节）读回取低 32 位**：指令必然 4 字节对齐，
+不可能跨越页边界，整字读在这里天然原子。同时 `up_user_read` /
+`up_user_write` 加了一页上限，禁止调用方再传跨页长度。
+
+**② 幂等短路：已是目标值就不重复写**
+
+每多写一次就多一次「页被标脏」的机会。开启/关闭路径现在都先读一遍，
+值已经对了就**直接返回**，不再碰内存。
+
+> 注意：这两个修法本身都**不足以**避免崩溃 —— 崩溃的判定发生在**页状态**
+> 上，不在写入次数上。真正起作用的是 `cs_debugged`。前两条是顺路清掉的
+> 隐患。
+
+##### 需要真机验证的点
+
+日志里会明确标出保险是否落上：
+
+- `内透已开启 · 0x…（原值 … → …）· codesign 保险已就位` → 最优
+- `… · codesign 保险未落上（偏移表缺失或写入被拒）` → 内透仍可用，
+  但 smoba 仍有被击杀风险，需要按这条线索继续查
+
+若仍崩溃，下一步方向是把 `vm_map_entry.protection` 在写入前后
+临时放宽/恢复，或在 `pmap` 层面处理 —— 但那属于更深的改动，
+**先把 `cs_debugged` 这条路在真机上验完再说**。
+
+
 ### 读取路径的分层
 
 修复后 `unitypatch.m` 的读取分成明确两层：
@@ -788,7 +939,8 @@ Polaris/
 
 | 版本 | 变更 |
 |---|---|
-| 0.4.9 | **★ 谜题解开并修复：抬高 `named_entry->size`，跨过真正的拦路虎。** v0.4.8 的逐档留痕拿到了决定性数据：`#1 off=0x9e3c000 prot=0x47 -> (4)`、`#2 prot=0x7 -> (0x11)`、`#3 prot=0x3 -> (4)`、`#4 off=0 sz=0x8000000 prot=0x7 -> (0x11)`。<br>**① 反推出 `named_entry->protection = 0x3`**：`0x7` 被拒 ⇒ 缺 `EXECUTE`；`0x3` 通过 ⇒ 含 `READ\|WRITE`。（这**推翻了我此前「`0x47` 必成功」的模型** —— 它确实过了权限门，但倒在了第二道门。）<br>**② 定位真正的拦路虎 = 尺寸门**（`mementry.c:4198`）：`named_entry->size`(`0x8000000`=128MB) < `obj_offs+size`(`0x9e3c000+0x4000`=`0x9e40000`=158MB) ⇒ `(4)`。这也解释了 `#2` 为何报 `0x11` 而非 `0x4` —— **权限门在尺寸门之前**，`0x7` 先被权限门拒掉，根本没走到尺寸门。模型与真机 **4/4 吻合**。<br>**③ 修法**：尺寸门只是**纯数值比较**（无任何硬件/MMU 约束），故直接 `ds_kwrite64(namedEntry+0x20, pr_round_page(entryOffset+PAGE))` 把它抬高到够用；`named_entry` 是本进程私有对象、随 `mach_vm_deallocate` 释放，影响面可控。<br>**④ 加固末档 prot**：此前用 `VM_PROT_ALL`(`0x7`) 恰好是已知必败组合，改为同时试 `0x3` 与 `0x47`。<br>**⑤ 预防性扩容**：`gTierTrace` 512→1024 —— 阶梯最多可展到 8 档（2 offset × 3 prot + 2 整块），单档最长 83 字节，`8×83=664 > 512` **又会踩截断的坑**。<br>**预测**：修复后 `#1 off=0x9e3c000 sz=0x4000 prot=0x47` 将**直接成功且偏移精确**，内透读写落到正确页面 |
+| 0.5.0 | **★ 内透读写链路已打通，本版修复随之暴露的「smoba 被 codesign 击杀」。** v0.4.9 真机日志证明 `内透已开启 · 0x1387c3824（原值 0xAA1803E1 → 0xD2800021）` + `transparent wall ready — base=0x12e984000`（差值正好 `0x9e3f824` ✅），**v0.4.9 的修复成立**；但约 10 秒后 smoba 收到 `SIGKILL`，`termination = {namespace: CODESIGNING, code: 2, indicator: "Invalid Page"}`、`ktriageinfo = "VM - (arg = 0x0) CL - "`。<br>**① 定位崩溃与补丁同页**：崩溃地址 `0x1387c0810` 与补丁点 `0x1387c3824` 同属 16KB 页 `0x1387c0000`，`vmRegionInfo` 确认落在 UnityFramework `__TEXT`(`r-x/rwx SM=COW`)。<br>**② 机制（逐段核对 XNU 源码）**：我们写脏了一页已签名的代码页 ⇒ 该页带上 `vmp_wpmapped`/`vmp_dirty` ⇒ smoba 再碰它时 `vm_fault_enter()` 命中 `vm_fault_cs_page_immutable() && (prot & VM_PROT_WRITE \|\| m->vmp_wpmapped)` ⇒ `vm_fault_cs_handle_violation()` ⇒ `cs_invalid_page()`（`bsd/kern/kern_cs.c`）里 `if (flags & CS_KILL) send_kill = 1` ⇒ `threadsignal(SIGKILL, EXC_BAD_ACCESS)`。smoba 是平台二进制，csflags 带 `CS_KILL`，必死。<br>**③ 修法：写 `vm_map->cs_debugged` / `switch_protect`**。这是官方 `cs_allow_invalid()` 的后半段（同文件）：它除了清 `CS_KILL\|CS_HARD`，还做 `vm_map_switch_protect(map, FALSE)` + `vm_map_cs_debugged_set(map, TRUE)`。Polaris 不调内核函数，直接把这两个布尔字段写进 smoba 的 `vm_map`（`vmMap + off_vm_map_hdr + 0x98/0x99`），等价于「让系统认为 smoba 是被调试的进程」，`cs_invalid_page()` 收到 `CS_KILL` 便放行。新增 `off_vm_map_cs_debugged = 0x98`、`off_vm_map_switch_protect = 0x99`（据 `osfmk/vm/vm_map.h` 位域排布）。<br>**④ 顺路清掉两个真 bug**：**(a) 4 字节回读会读到错页** —— `0x9E3F824` 在 16KB 页里偏移 `0x3824`，`0x3824 + 4 > 0x4000`，`polaris_remote_read()` 的跨页分支会把它拆成两次映射、第二次落到**另一页**，导致「写成功却报失败」；改为**整字(8B)读回取低 32 位**（指令 4 字节对齐，必然不跨页，天然原子），并给 `up_user_read/write` 加「单次不得超过一页」的上限。**(b) 幂等短路**：开启/关闭前先读一遍，值已是目标值就**直接返回**，不再多写一次（每写一次就多一次标脏机会）。另修 `up_user_readstr` 里写死的 `0x1000` 页内切分（16KB 页机器上让同页被映射 4 次），改用运行期页大小。<br>**⑤ 诚实边界**：④ 的两条**本身不足以**避免崩溃 —— 崩溃判定在**页状态**上而非写入次数上，真正起作用的是 ③。日志会明确标出 `codesign 保险已就位` / `codesign 保险未落上`，需真机确认 |
+| 0.4.9 | **★ 谜题解开并修复：抬高 `named_entry->size`，跨过真正的拦路虎。** v0.4.8 的逐档留痕拿到了决定性数据：`#1 off=0x9e3c000 prot=0x47 -> (4)`、`#2 prot=0x7 -> (0x11)`、`#3 prot=0x3 -> (4)`、`#4 off=0 sz=0x8000000 prot=0x7 -> (0x11)`。<br>**① 反推出 `named_entry->protection = 0x3`**：`0x7` 被拒 ⇒ 缺 `EXECUTE`；`0x3` 通过 ⇒ 含 `READ\|WRITE`。（这**推翻了我此前「`0x47` 必成功」的模型** —— 它确实过了权限门，但倒在了第二道门。）<br>**② 定位真正的拦路虎 = 尺寸门**（`mementry.c:4198`）：`named_entry->size`(`0x8000000`=128MB) < `obj_offs+size`(`0x9e3c000+0x4000`=`0x9e40000`=158MB) ⇒ `(4)`。这也解释了 `#2` 为何报 `0x11` 而非 `0x4` —— **权限门在尺寸门之前**，`0x7` 先被权限门拒掉，根本没走到尺寸门。模型与真机 **4/4 吻合**。<br>**③ 修法**：尺寸门只是**纯数值比较**（无任何硬件/MMU 约束），故直接 `ds_kwrite64(namedEntry+0x20, pr_round_page(entryOffset+PAGE))` 把它抬高到够用；`named_entry` 是本进程私有对象、随 `mach_vm_deallocate` 释放，影响面可控。<br>**④ 加固末档 prot**：此前用 `VM_PROT_ALL`(`0x7`) 恰好是已知必败组合，改为同时试 `0x3` 与 `0x47`。<br>**⑤ 预防性扩容**：`gTierTrace` 512→1024 —— 阶梯最多可展到 8 档（2 offset × 3 prot + 2 整块），单档最长 83 字节，`8×83=664 > 512` **又会踩截断的坑**。<br>**⑥ 结果（真机已确认）**：`内透已开启 · 0x1387c3824（原值 0xAA1803E1 → 0xD2800021）`、`transparent wall ready — base=0x12e984000 target=0x1387c3824` —— **读写链路完全打通**。遗留的 smoba 崩溃由 v0.5.0 处理 |
 | 0.4.8 | **修「诊断信息被截断」+ 找到 `named_entry->offset` 这个真 bug**。第三轮真机（v0.4.7）档数已从 1 涨到 4（二维展开生效），但仍报 `invalid right(0x11)`；且日志止于 `· obj=0xffffffe66cffed00 ob` ——**被静默截断**。逐层查出是缓冲区太小：`remotepage.m` 的 `gMessage`(256) / `gFirstFailDetail`(192)、`unitypatch.m` 的 `gMessage`(256) / `why`(192) / `detail`(192)、以及**真正的截断点** `PolarisBridge.mm` 的 `char message[256]`（×3）——`remotepage` 拼好的长信息在 C→OC 边界又被砍回 256 字节。全部统一扩到 1024。同时：**① 新增 `gTierTrace` 逐档留痕**，每档记 `#n off/sz/prot -> err`，失败时整条打出（此前只看得到末档，第 1 档 `prot=ALL\|IS_MASK` 报什么错完全不可见）；**② `gEntryTrace` 补上原始输入** `eStart`/`vmeOffraw`；**③ `vme_offset` 非 0 时主动告警**。数值核对：`target-base = 0x9e3f824` ✅；`obj=0xffffffe66cffed00` ✅ 落在 `[VM_MIN,VM_MAX]` 内且 64 字节对齐（**排除「压缩指针解包错误」**）。<br>**④ 本版核心新发现（对照 XNU 源码确证）：`named_entry->offset` 才是真正生效的对象内偏移。** `mementry.c:4212` 在 `named_entry->offset` 非 0 时执行 `vm_map_enter_adjust_offset(&obj_offs, ..., named_entry->offset)`，而该函数（`mementry.c:3966`）做的是 **加法** `*obj_offs += quantity` —— 故 `effective_offset = mach_vm_map 的 off + named_entry->offset`。此值在建 entry 时由 `mementry2.c:890` 从本地 entry 的 `vme_offset` **快照冻结**，而我们写的 `entry.vme_offset = object->objectOffset` 是**单位错误**（字节 ≠ 4KB 页号）。这解释了「offset 维度为何形同无效」：所有候选被同一个加法项整体平移，v0.4.6 的 `0x9e3c000` 与 v0.4.7 的 `0` 表现一致。修法：`ds_kwrite64` 把 `named_entry->offset` **显式归零**，偏移改由 `mach_vm_map` 的 `off` 全权决定。`struct vm_named_entry` 布局由 XNU 源码定，并用两个已知值交叉校验（`backing=+0x10` ✅、`size=+0x20` ✅ ⇒ `offset=+0x18`）。<br>**⑤ 澄清 `0x8000000`(128MB) 不是异常**：等于 `osfmk/mach/arm/vm_param.h` 的 `ANON_CHUNK_SIZE`，内核按 128MB 分块匿名对象，`named_entry` 只覆盖首块，故它与 `vm_object` 大小**本就不相等**。<br>**⑥ 证伪一个假设**：曾疑 `pr_vmmapentry` 联合首成员 4 vs 8 字节导致 `vme_offset` 错位，用 `-fdump-record-layouts` 交叉编译实测两者布局**完全相同**（`vme_alias:12`+`vme_offset:52` 共 64 位，必然独占一个 64 位单元），无需改动。<br>**⑦ 记下一个待真机复核的悖论**：按 `mementry.c:4163-4189` 穷举 `named_entry->protection` 的 0x00–0x7f，**不存在任何取值**能让 `0x47` 档返回 `0x11`（mask 置位后请求权限先取交集，子集校验必然成立）。故 v0.4.7 的「全部 4 档均失败」与源码模型不符，**必须靠逐档明细判定**，在此之前不再叠加新假设。**→ v0.4.9 用逐档数据解开了此悖论** |
 | 0.4.7 | **修复 `(os/kern) invalid right(0x11)`，并修正 v0.4.6 阶梯的两处缺陷**。真机 v0.4.6 日志把错误码从 `KERN_INVALID_ARGUMENT(4)` 推进到 `KERN_INVALID_RIGHT(17)`——**offset/size 那层已经通过**，说明 v0.4.6 的阶梯方向对了。剩下的拒绝点是 `vm_map.c:4184/4189` 的权限子集校验：entry 是 `R\|W`(`0x3`)，map 请求 `VM_PROT_ALL`(`0x7`)，`(0x3 & 0x7) != 0x7` → 拒。**① 恢复 `VM_PROT_IS_MASK`(`0x40`) 作为首选 prot 候选**：v0.4.5 以「语义用错」为由移除它是**错的**，它其实是 XNU 的权限收敛机制（置位后内核先做 `cur_protection &= named_entry->protection`，把 `0x7` 收缩成 `0x3`），不影响「映射后能否读写」，只影响「请求权限怎么收敛」。**② `mach_make_memory_entry_64` 的 protection 提到 `VM_PROT_ALL`**（失败退回 `READ\|WRITE`），让「请求权限 ⊆ entry 权限」恒成立。**③ 阶梯从一维改为二维笛卡尔积** {`entryOffset`, `entryOffset-objectOffset`} × {`ALL\|IS_MASK`, `ALL`, `RW`}：v0.4.6 所有 offset 候选的生成条件都写死 `mapOffset != 0`，而真机这次 `entryOffset == 0`，于是只剩 1 档，正好对应日志里的「全部 1 档均失败」。**④** 失败信息末尾无条件追加 `gEntryTrace`（`obj/objsz/entryOff/objOff`），避免这四个关键数被后续 `pr_set_message` 覆盖。**`VM_PROT_IS_MASK` 假设经第三轮真机未能证实（4 档全败）** |
 | 0.4.6 | **用「阶梯重试」取代对 `mach_vm_map` 单次调用**：v0.4.5 加的 `named_entry->size` 校验经真机数据回算后**未被触发**（`0x16584000` = 357MB ≥ 需要的 `0x9e40000` = 158MB），说明拒绝点不在尺寸上。把 `KERN_INVALID_ARGUMENT(4)` 逐条对回 `vm_map.c` 的所有分支后，剩下的候选（`named_entry->offset` 非 0 导致 `obj_offs` 二次累加；或 `named_entry->size` 真实值更小）静态无法区分，于是改为按优先级逐个尝试 offset/size/prot 组合，失败档位零副作用。新增 `polaris_vmshmem_t.exact` 安全闸门：**读路径**允许不精确映射（Mach-O magic 自校验兜底），**写路径强制要求精确**，避免退化的 `offset=0` 映射把 4 字节写到游戏对象的错误页上。**遗留缺陷（v0.4.7 修）：阶梯写成一维且条件写死 `mapOffset != 0`，`entryOffset == 0` 时只剩 1 档** |

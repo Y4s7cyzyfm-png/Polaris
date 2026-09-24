@@ -172,6 +172,7 @@ uint32_t off_vm_object_ref_count = 0;
 uint32_t off_vm_named_entry_backing_copy = 0;
 uint32_t off_vm_named_entry_size = 0;
 uint32_t off_vm_named_entry_offset = 0;
+uint32_t off_vm_map_cs_bits = 0;
 uint32_t off_label_l_perpolicy_amfi = 0;
 uint32_t off_label_l_perpolicy_sandbox = 0;
 uint32_t sizeof_ipc_entry = 0;
@@ -274,6 +275,7 @@ static off32entry const koff32entries[] = {
     OFFSET32(off_vm_named_entry_backing_copy),
     OFFSET32(off_vm_named_entry_size),
     OFFSET32(off_vm_named_entry_offset),
+    OFFSET32(off_vm_map_cs_bits),
     OFFSET32(off_label_l_perpolicy_amfi),
     OFFSET32(off_label_l_perpolicy_sandbox),
     OFFSET32(sizeof_ipc_entry),
@@ -795,6 +797,10 @@ void offsets_init(void) {
         off_vm_named_entry_backing_copy = 0x10;
         off_vm_named_entry_size = 0x20;
         off_vm_named_entry_offset = 0x18;
+        // 位域字（含 switch_protect:bit4 / cs_debugged:bit15）相对
+        // vm_map_header 的偏移。绝对位置 = vm_map + 0x10 + 0x80 = vm_map + 0x90，
+        // 与 XNU `struct _vm_map` 实测布局一致（见 unitypatch.m 详解）。
+        off_vm_map_cs_bits = 0x80;
         off_label_l_perpolicy_amfi = 0x8;
         off_label_l_perpolicy_sandbox = 0x10;
 
@@ -1054,6 +1060,10 @@ void offsets_init(void) {
         off_vm_named_entry_backing_copy = 0x10;
         off_vm_named_entry_size = 0x20;
         off_vm_named_entry_offset = 0x18;
+        // 位域字（含 switch_protect:bit4 / cs_debugged:bit15）相对
+        // vm_map_header 的偏移。绝对位置 = vm_map + 0x10 + 0x80 = vm_map + 0x90，
+        // 与 XNU `struct _vm_map` 实测布局一致（见 unitypatch.m 详解）。
+        off_vm_map_cs_bits = 0x80;
         off_label_l_perpolicy_amfi = 0x8;
         off_label_l_perpolicy_sandbox = 0x10;
 
@@ -1379,6 +1389,10 @@ void offsets_init(void) {
         off_vm_named_entry_backing_copy = 0x10;
         off_vm_named_entry_size = 0x20;
         off_vm_named_entry_offset = 0x18;
+        // 位域字（含 switch_protect:bit4 / cs_debugged:bit15）相对
+        // vm_map_header 的偏移。绝对位置 = vm_map + 0x10 + 0x80 = vm_map + 0x90，
+        // 与 XNU `struct _vm_map` 实测布局一致（见 unitypatch.m 详解）。
+        off_vm_map_cs_bits = 0x80;
         off_label_l_perpolicy_amfi = 0x8;
         off_label_l_perpolicy_sandbox = 0x10;
 
