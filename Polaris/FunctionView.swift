@@ -42,9 +42,13 @@ struct FunctionView: View {
 
     @State private var verboseLog = false
 
-    // MARK: - 功能开关（占位，暂无实际逻辑）
+    // MARK: - 功能开关
 
-    @State private var filesystemRW = false
+    /// 开启内透（王者荣耀 · UnityFramework 指令补丁）
+    /// 由 toggle 的 set 触发，真实状态每轮从 Bridge 回读（单一数据源在 C 侧）
+    @State private var transparentWall = false
+    @State private var transparentWallBusy = false
+    @State private var transparentWallDetail: String = "内透未开启"
 
     // 0.5s 轮询，与 Bridge 的进度通知双通道刷新
     private let timer = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
@@ -127,14 +131,18 @@ struct FunctionView: View {
         }
     }
 
-    // MARK: - 功能开关卡片（占位）
+    // MARK: - 功能开关卡片
 
     private var featuresCard: some View {
         Card(title: "功能开关") {
-            FeatureRow(icon: "externaldrive.fill",
-                       title: "开启内透",
-                       subtitle: "小地图显示全图视野",
-                       isOn: $filesystemRW)
+            FeatureToggleRow(icon: "eye.fill",
+                             title: "开启内透",
+                             subtitle: transparentWallDetail,
+                             isOn: Binding(
+                                get: { transparentWall },
+                                set: { handleTransparentWall($0) }
+                             ),
+                             enabled: state == .success && !transparentWallBusy)
         }
     }
 
@@ -172,6 +180,32 @@ struct FunctionView: View {
         refresh()
     }
 
+    /// 内透开关：开启时定位 UnityFramework 并写入补丁指令，关闭时还原原始指令。
+    /// 真实状态以 Bridge 为准，操作后立即 refresh 回读，失败则自动回弹开关。
+    private func handleTransparentWall(_ enable: Bool) {
+        guard state == .success else {
+            UINotificationFeedbackGenerator().notificationOccurred(.warning)
+            return
+        }
+        guard !transparentWallBusy else { return }
+
+        transparentWallBusy = true
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+
+        let ok = PolarisSetTransparentWall(enable)
+        transparentWallBusy = false
+
+        refresh()
+
+        if ok {
+            UINotificationFeedbackGenerator().notificationOccurred(.success)
+        } else {
+            // 失败：开关回弹到真实状态
+            UINotificationFeedbackGenerator().notificationOccurred(.error)
+            transparentWall = PolarisTransparentWallIsEnabled()
+        }
+    }
+
     /// 从 Bridge 拉取最新状态并刷新 UI
     private func refresh() {
         let ready = PolarisKernelIsReady()
@@ -186,6 +220,10 @@ struct FunctionView: View {
         gameReady = PolarisGameProcessIsReady()
         gamePid = PolarisGameProcessPID()
         gameStatus = PolarisGameProcessStatus()
+
+        // 内透开关：以 C 侧为准回读，避免 Swift 本地状态与内核实际状态不一致
+        transparentWall = PolarisTransparentWallIsEnabled()
+        transparentWallDetail = transparentWallSubtitle()
 
         if ready {
             state = .success
@@ -203,6 +241,22 @@ struct FunctionView: View {
     private func clearLog() {
         PolarisClearConsoleLog()
         refresh()
+    }
+
+    /// 内透开关的副标题：优先展示 Bridge 给出的具体状态文案
+    private func transparentWallSubtitle() -> String {
+        if state != .success {
+            return "需先启动内核利用"
+        }
+        let status = PolarisTransparentWallStatus()
+        if !status.isEmpty && status != "内透未开启" {
+            return status
+        }
+        if PolarisTransparentWallIsEnabled() {
+            let target = PolarisTransparentWallTarget()
+            return String(format: "已开启 · 0x%llx", target)
+        }
+        return "小地图显示全图视野"
     }
 
     // MARK: - 子视图辅助
@@ -252,7 +306,7 @@ private struct StatusCardView: View {
                     .font(.system(size: 14, weight: .semibold))
                     .foregroundStyle(statusColor)
                 Spacer()
-                Text("v0.3.0")
+                Text("v0.4.0")
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 8)
@@ -581,28 +635,31 @@ private struct LogConsoleCard: View {
 
 // MARK: - 功能开关行
 
-private struct FeatureRow: View {
+private struct FeatureToggleRow: View {
     let icon: String
     let title: String
     let subtitle: String
     @Binding var isOn: Bool
+    var enabled: Bool = true
 
     var body: some View {
         Toggle(isOn: $isOn) {
             HStack(spacing: 12) {
-                RowIcon(systemName: icon)
+                RowIcon(systemName: icon, color: enabled ? Theme.accent : Color(white: 0.45))
                 VStack(alignment: .leading, spacing: 2) {
                     Text(title)
                         .font(.system(size: 15, weight: .medium))
-                        .foregroundStyle(.white)
+                        .foregroundStyle(enabled ? .white : Color(white: 0.62))
                     Text(subtitle)
                         .font(.system(size: 12))
                         .foregroundStyle(.secondary)
+                        .lineLimit(2)
                 }
             }
         }
         .toggleStyle(.switch)
         .tint(Theme.accent)
+        .disabled(!enabled)
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
     }

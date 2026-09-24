@@ -13,11 +13,46 @@
 - 就绪后展示 Kernel Base / Kernel Slide（内核读写原语已建立）
 - 利用选项：利用引擎（DarkSword，固定）、详细日志（实时控制台）
 - 控制台日志：环形缓冲实时滚动，同步落盘 `Documents/polaris.log`（write+fsync，闪退不丢）
-- 功能开关：开启内透（占位，暂无实际逻辑）
+- 功能开关：**开启内透**（王者荣耀 · UnityFramework 指令补丁，可开关还原）
 
 **Tab 2 · 设置**
 - 加入官方 Telegram 频道（打开链接）
 - 关于：版本 / 项目代号 / 构建环境
+
+## 开启内透（王者荣耀）
+
+把内核读写直接作用到游戏进程的 UnityFramework 映像上，补丁地址：
+
+```
+target = UnityFrameworkBase + 0x09E3F824      // 开启写入
+value  = 0xD2800021                           // arm64: mov w1, #1
+                                              // 等价于 CFSwapInt32(0x210080D2)
+```
+
+做法与常见 dylib 插件一致（插件版见 `Patchoffset.h` 的 `write_mem<T>`），
+区别只在**跨进程**：
+
+| | dylib 插件 | Polaris |
+|---|---|---|
+| 运行位置 | 游戏进程内 | 独立 App |
+| 基址来源 | `dyld_get_image_vmaddr_slide()` | 内核遍历 smoba 的 `vm_map` 条目 |
+| 写内存 | `vm_protect` + `vm_write`（本进程） | `ds_kwrite32()`（内核原语，无需改页权限） |
+
+**基址定位**（`Vendor/unitypatch.m`）：
+
+1. `proc_find_by_name("smoba")` → `proc_task()` → `task_get_vm_map()`
+2. 遍历 vm_map 条目，在 `[0x100000000, 0x800000000)` 窗口内读首页 Mach-O 头
+3. 校验 `MH_MAGIC_64` + `CPU_TYPE_ARM64`，再解析 `LC_ID_DYLIB` 取安装名
+4. 命中名含 `UnityFramework` 的映像即为基址；取不到库名时退回「最大的 arm64 dylib」
+
+**开关语义**（与逆向源码一致）：
+
+- 开启：先备份目标地址原始指令，再写入 `0xD2800021`，然后**回读校验**
+- 关闭：把备份的原始指令写回
+- 备份只做一次，重复开关不会把补丁值当成原始值
+- 写不生效（回读不符）会明确报错，不会谎报成功
+
+**注意**：合入对局后 UnityFramework 才加载完成，请在游戏内进入对局后再开启内透。
 
 ## 获取游戏进程
 
@@ -51,6 +86,7 @@ DarkSword 内核利用代码来自 [Rein](https://github.com/Y4s7cyzyfm-png/Rein
 - 核心：`darksword.m`（漏洞利用 + krw 原语）、`offsets.m`（内核偏移）、`utils.m`
 - 支撑：`pe/`（vfs / sbx / vnode / xpaci）、`fileport.h`
 - 游戏进程：`gameproc.m`（按进程名解析 `smoba`，见上一节）
+- 内透补丁：`unitypatch.m`（跨进程定位 UnityFramework + 指令补丁，见上一节）
 - 预编译库：`libxpf.dylib`、`libgrabkernel2.dylib`（arm64e thin，运行时从 `Frameworks/` 加载）
 - persistence 使用 stub（`transfer_krw_to_launchd` 不启用）
 - 不含：RemoteCall、TaskRop、choma、decrypt/ota/screentime 等非必需模块

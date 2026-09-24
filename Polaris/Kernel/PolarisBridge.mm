@@ -30,6 +30,7 @@ extern "C" {
 #import "darksword.h"
 #import "gameproc.h"
 #import "offsets.h"
+#import "unitypatch.h"
 #import "utils.h"
 }
 
@@ -48,6 +49,9 @@ static std::atomic_bool g_gameReady(false);
 static std::atomic<int> g_gamePid(0);
 static std::atomic<uint64_t> g_gameProcAddr(0);
 static NSString *g_gameStatus = @"尚未获取游戏进程";
+
+// 内透（UnityFramework 指令补丁）状态文案
+static NSString *g_wallStatus = @"内透未开启";
 
 // ---------------------------------------------------------------------------
 // In-app console log ring buffer（功能页「详细日志」视图的数据源）
@@ -562,6 +566,89 @@ uint64_t PolarisGameProcessProcAddress(void) { return g_gameProcAddr.load(); }
 NSString *PolarisGameProcessStatus(void) {
     os_unfair_lock_lock(&g_stateLock);
     NSString *status = [g_gameStatus copy] ?: @"";
+    os_unfair_lock_unlock(&g_stateLock);
+    return status;
+}
+
+// ---------------------------------------------------------------------------
+// 功能开关：开启内透（王者荣耀）
+// ---------------------------------------------------------------------------
+
+BOOL PolarisSetTransparentWall(BOOL enable) {
+    if (!PolarisKernelIsReady()) {
+        os_unfair_lock_lock(&g_stateLock);
+        g_wallStatus = @"内核未就绪，请先启动内核利用";
+        os_unfair_lock_unlock(&g_stateLock);
+        polaris_set_error(@"请先启动内核利用，再开启内透。");
+        polaris_post_progress();
+        return NO;
+    }
+
+    if (!enable) {
+        // 关闭：还原原始指令，不算错误路径
+        polaris_set_error(@"");
+        bool ok = polaris_set_transparent_wall(false);
+        char message[256] = {0};
+        polaris_describe_transparent_wall(message, (int)sizeof(message));
+        os_unfair_lock_lock(&g_stateLock);
+        g_wallStatus = message[0] ? @(message) : @"内透已关闭";
+        os_unfair_lock_unlock(&g_stateLock);
+        polaris_set_stage(g_wallStatus);
+        PB_LOG("transparent wall disable -> %{public}@", g_wallStatus);
+        polaris_post_progress();
+        return ok ? YES : NO;
+    }
+
+    polaris_set_error(@"");
+    polaris_set_stage(@"正在定位 UnityFramework");
+
+    // 同步执行：内核 vm_map 遍历 + 一次 4 字节写入，耗时极短。
+    bool ok = polaris_set_transparent_wall(true);
+
+    char message[256] = {0};
+    polaris_describe_transparent_wall(message, (int)sizeof(message));
+    NSString *status = message[0] ? @(message) : @"内透操作失败";
+
+    os_unfair_lock_lock(&g_stateLock);
+    g_wallStatus = status;
+    os_unfair_lock_unlock(&g_stateLock);
+    polaris_set_stage(status);
+
+    if (!ok) {
+        PB_LOG_ERROR("transparent wall enable failed: %{public}@", status);
+        polaris_set_error(status);
+        polaris_post_progress();
+        return NO;
+    }
+
+    PB_LOG("transparent wall ready — base=0x%llx target=0x%llx",
+           (unsigned long long)polaris_transparent_wall_unity_base(),
+           (unsigned long long)polaris_transparent_wall_target());
+    polaris_post_progress();
+    return YES;
+}
+
+BOOL PolarisTransparentWallIsEnabled(void) {
+    return polaris_transparent_wall_is_enabled() ? YES : NO;
+}
+
+BOOL PolarisTransparentWallHasBackup(void) {
+    // 有备份 == 定位并处理过目标，可以安全还原
+    return polaris_transparent_wall_state() != UNITY_PATCH_IDLE &&
+           polaris_transparent_wall_state() != UNITY_PATCH_UNSUPPORTED;
+}
+
+uint64_t PolarisTransparentWallUnityBase(void) {
+    return polaris_transparent_wall_unity_base();
+}
+
+uint64_t PolarisTransparentWallTarget(void) {
+    return polaris_transparent_wall_target();
+}
+
+NSString *PolarisTransparentWallStatus(void) {
+    os_unfair_lock_lock(&g_stateLock);
+    NSString *status = [g_wallStatus copy] ?: @"";
     os_unfair_lock_unlock(&g_stateLock);
     return status;
 }

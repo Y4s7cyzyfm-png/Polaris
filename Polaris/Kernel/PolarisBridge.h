@@ -53,6 +53,29 @@ uint64_t PolarisGameProcessProcAddress(void);
 /// 游戏进程状态文案（例如「游戏进程已找到（smoba · pid 1234）」）。
 NSString *PolarisGameProcessStatus(void);
 
+// ---------------------------------------------------------------------------
+// 功能开关：开启内透（王者荣耀 · UnityFramework 指令补丁）
+// ---------------------------------------------------------------------------
+
+/// 设置内透开关。开启时定位 UnityFramework、备份原指令并写入 0xD2800021；
+/// 关闭时写回原始指令。失败原因写入 PolarisBridgeLastError()。
+BOOL PolarisSetTransparentWall(BOOL enable);
+
+/// 内透是否已开启。
+BOOL PolarisTransparentWallIsEnabled(void);
+
+/// 是否已备份原始指令（用于判断能否还原，以及是否已定位过目标）。
+BOOL PolarisTransparentWallHasBackup(void);
+
+/// 已定位的 UnityFrameworkBase（0 = 尚未定位）。
+uint64_t PolarisTransparentWallUnityBase(void);
+
+/// 目标补丁地址 UnityFrameworkBase + 0x09E3F824（0 = 尚未定位）。
+uint64_t PolarisTransparentWallTarget(void);
+
+/// 内透状态文案。
+NSString *PolarisTransparentWallStatus(void);
+
 // In-app console log ring buffer (also mirrored to Documents/polaris.log).
 NSArray<NSString *> *PolarisConsoleLogLines(void);
 void PolarisClearConsoleLog(void);
