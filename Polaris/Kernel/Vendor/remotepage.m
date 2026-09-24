@@ -175,7 +175,10 @@ static char gLastGoodLabel[96] = {0};
 
 /// vm_object / entry 的现场数值（在 pr_create_shmem_with_obj 里填）。
 /// pr_set_message 会被后续覆盖，所以单独留一份，供 describe 输出。
-static char gEntryTrace[192] = {0};
+///
+/// ★ v0.4.8 扩容 192→512：现在还要追加 named_entry->offset / size
+///   两个此前从未观测过的字段（见 pr_create_shmem_with_obj 的追加逻辑）。
+static char gEntryTrace[512] = {0};
 
 /// ★ v0.4.8：**逐档**的失败明细。
 ///
@@ -528,11 +531,74 @@ static polaris_vmshmem_t pr_create_shmem_with_obj(struct pr_vmobj *object) {
         return shmem;
     }
 
+    // ★★★ v0.4.8 关键修正：named_entry->offset 才是真正的对象内偏移。
+    //
+    //   XNU 证据链（逐条核对过源码）：
+    //
+    //   (1) mementry.c:4212
+    //         if (named_entry->offset) {
+    //             vm_map_enter_adjust_offset(&obj_offs, &obj_end,
+    //                                        named_entry->offset);
+    //         }
+    //       而 vm_map_enter_adjust_offset (mementry.c:3966) 做的是
+    //         *obj_offs += quantity;  —— 是**加法**，不是替换。
+    //
+    //   (2) mementry2.c:890（mach_make_memory_entry_64 内部）
+    //         user_entry->offset = VME_OFFSET(vm_map_copy_first_entry(copy));
+    //       即 offset 在**建 entry 那一刻**就从本地 entry 的 vme_offset
+    //       快照下来，之后不再变。
+    //
+    //   (3) mementry.c:21519（vm_named_entry_to_vm_object）
+    //         object = VME_OBJECT(copy_entry);
+    //       取对象时**根本不看 vme_offset**。
+    //
+    //   结论：真正生效的对象内偏移是
+    //         effective_offset = mach_vm_map 的 off  +  named_entry->offset
+    //
+    //   而我们建 entry 时 entry.vme_offset = object->objectOffset 有
+    //   **单位错误**：objectOffset 是字节，vme_offset 是 4KB 页单位
+    //   （VME_OFFSET(x) = x << 12）。因 (3) 它不影响取对象，但会让
+    //   named_entry->offset 变成一个偏大的错值，进而把阶梯里
+    //   所有 offset 候选都整体平移掉 —— 这正是 offset 维度"看起来无效"的原因。
+    //
+    //   修法：显式把 named_entry->offset **归零**，让偏移完全由
+    //   mach_vm_map 的 off 决定。这样 O1/O2 才真正可分辨。
+    bool     okNEOff       = false;
+    uint64_t namedEntryOff = pr_safe_kread64(shmemnamedentry + off_vm_named_entry_offset,
+                                             &okNEOff);
+    bool     neOffZeroed   = false;
+    if (okNEOff && namedEntryOff != 0) {
+        @try {
+            ds_kwrite64(shmemnamedentry + off_vm_named_entry_offset, 0);
+            neOffZeroed = true;
+        } @catch (NSException *e) {
+            neOffZeroed = false;
+        } @catch (...) {
+            neOffZeroed = false;
+        }
+    }
+    // 把 named_entry 的两个此前从未观测过的字段带进 trace
+    snprintf(gEntryTrace + strlen(gEntryTrace),
+             sizeof(gEntryTrace) - strlen(gEntryTrace),
+             " neOff=0x%llx%s",
+             (unsigned long long)namedEntryOff,
+             (neOffZeroed ? "(已归零)" : (namedEntryOff ? "(归零失败)" : "")));
+
     // ★ 诊断：直接读内核里 vm_named_entry 的 size 字段。
     //   这是 vm_map.c:4155 守卫真正比对的那个值（named_entry->size），
     //   比 entrysize 回读值更权威。有它就能一眼断定是不是"entry 太小"。
+    //
+    //   注意：它**本来就不等于 vm_object 大小**。osfmk/mach/arm/vm_param.h 里
+    //       #define ANON_CHUNK_SIZE (128ULL * 1024 * 1024)   /* 128MB */
+    //   内核按 128MB 分块匿名对象，named_entry 只覆盖首块 —— 真机上
+    //   观测到的 0x8000000 正是这个常量，属预期行为而非异常。
     bool okNEs = false;
     uint64_t namedEntrySize = pr_safe_kread64(shmemnamedentry + off_vm_named_entry_size, &okNEs);
+    if (okNEs) {
+        snprintf(gEntryTrace + strlen(gEntryTrace),
+                 sizeof(gEntryTrace) - strlen(gEntryTrace),
+                 " neSz=0x%llx", (unsigned long long)namedEntrySize);
+    }
 
     bool okBC = false, okSZ = false;
     uint64_t shmemvmcopyaddr = pr_safe_kread64(shmemnamedentry + off_vm_named_entry_backing_copy, &okBC);
