@@ -360,13 +360,36 @@ static polaris_vmshmem_t pr_create_shmem_with_obj(struct pr_vmobj *object) {
     bool okSize = false;
     uint64_t size = pr_safe_kread64(object->address + off_vm_object_vo_un1_vou_size, &okSize);
     if (!okSize) {
-        pr_set_message("读取 vm_object 大小失败");
+        pr_set_message("读取 vm_object 大小失败 (obj=0x%llx off=0x%x)",
+                       object->address, off_vm_object_vo_un1_vou_size);
         return shmem;
     }
     size = pr_round_page(size);
     uint64_t roundedsize = pr_round_page(size);
+
+    // ★ 诊断：把关键数值全报出来。目标页的 entryOffset 可能远大于单页，
+    // 如果它 >= roundedsize，mach_vm_map 就会超出 backing 范围而失败。
+    pr_set_message("obj=0x%llx size=%llu entryOff=0x%llx objOff=0x%llx",
+                   (unsigned long long)object->address,
+                   (unsigned long long)roundedsize,
+                   (unsigned long long)object->entryOffset,
+                   (unsigned long long)object->objectOffset);
+
+    // ★ 诊断闸门：目标偏移若越出 vm_object 覆盖范围，mach_vm_map 必然失败。
+    //
+    // 注意这里**只记录不拦截**：离线无法确证 vm_object 的 size 语义
+    // （vo_un1.vou_size 到底是字节数还是页数、是否含整个 __TEXT），
+    // 贸然 return 会把「本来能成的」也拒掉。先让它继续走，
+    // 由 mach_vm_map 的真实返回值来判定，日志里留证据。
+    if (object->entryOffset >= roundedsize) {
+        pr_set_message("警告：目标偏移 0x%llx 越出 vm_object 尺寸 0x%llx",
+                       (unsigned long long)object->entryOffset,
+                       (unsigned long long)roundedsize);
+        // 不 return —— 继续尝试
+    }
+
     if (roundedsize == 0) {
-        pr_set_message("vm_object 尺寸为 0");
+        pr_set_message("vm_object 尺寸为 0 (obj=0x%llx)", (unsigned long long)object->address);
         return shmem;
     }
 
@@ -471,7 +494,12 @@ static polaris_vmshmem_t pr_create_shmem_with_obj(struct pr_vmobj *object) {
                       memobj, (memory_object_offset_t)object->entryOffset,
                       false /* copy = FALSE */, curprot, maxprot, VM_INHERIT_NONE);
     if (ret != KERN_SUCCESS) {
-        pr_set_message("mach_vm_map 失败：%s", mach_error_string(ret));
+        // ★ 这是最关键的诊断点：把内核返回码、以及参与映射的三个数值全报出来，
+        // 这样真机日志能直接判定是「偏移越界」「权限不足」还是「memobj 无效」。
+        pr_set_message("mach_vm_map 失败：%s(0x%x) off=0x%llx pagesz=%llu",
+                       mach_error_string(ret), (unsigned)ret,
+                       (unsigned long long)object->entryOffset,
+                       (unsigned long long)PAGE_SIZE);
         mappedaddr = 0;
     }
 
@@ -572,6 +600,11 @@ static void pr_page_cache_put(uint64_t remotePage, uint64_t localPage) {
     }
 }
 
+/// 首次映射失败的详细原因。pr_set_message 会被后续调用覆盖，
+/// 而映射失败往往发生在深层（pr_create_shmem_with_obj 内部），
+/// 于是到上层只剩一句笼统的话。这里把第一次失败的完整原因单独留存。
+static char gFirstFailDetail[192] = {0};
+
 static uint64_t pr_map_remote_page(uint64_t remotePage) {
     uint64_t local = pr_page_cache_get(remotePage);
     if (local) return local;
@@ -583,7 +616,15 @@ static uint64_t pr_map_remote_page(uint64_t remotePage) {
 
     polaris_vmshmem_t sh = polaris_vmmap_remote_page(gRemoteVmMap, remotePage);
     if (!sh.used || !sh.localAddress) {
-        // 坏指针很常见（未映射页），只记前几次防刷屏
+        // ★ 保留第一次失败的详细原因（含 mach_vm_map 的内核返回码）
+        if (gFirstFailDetail[0] == '\0') {
+            if (gMessage[0] != '\0') {
+                snprintf(gFirstFailDetail, sizeof(gFirstFailDetail), "%s", gMessage);
+            } else {
+                snprintf(gFirstFailDetail, sizeof(gFirstFailDetail),
+                         "映射 0x%llx 失败（无详细信息）", (unsigned long long)remotePage);
+            }
+        }
         if (gMapFailLogged < 3) {
             gMapFailLogged++;
         }
@@ -606,6 +647,7 @@ void polaris_remote_flush_cache(void) {
     gPageCacheCount = 0;
     memset(gPageNeg, 0, sizeof(gPageNeg));
     gMapFailLogged = 0;
+    gFirstFailDetail[0] = '\0';
 }
 
 // ---------------------------------------------------------------------------
@@ -679,6 +721,15 @@ void polaris_remote_describe(char *buffer, int bufferSize) {
     if (!buffer || bufferSize <= 0) return;
     if (gRemoteVmMap == 0) {
         snprintf(buffer, (size_t)bufferSize, "跨进程访问未就绪（未登记目标 vm_map）");
+        return;
+    }
+    // ★ 优先返回「首次映射失败」的原因。
+    // 映射失败发生在深层（pr_create_shmem_with_obj 里 mach_vm_map 返回非 0），
+    // 那条信息会被后续无关的 pr_set_message 覆盖掉，所以单独留了一份。
+    // 只有它才能真正回答「为什么读不到目标页」——是偏移越界、权限不足，
+    // 还是 memobj 无效。放在 gMessage 之前判断，确保不会被冲掉。
+    if (gFirstFailDetail[0] != '\0') {
+        snprintf(buffer, (size_t)bufferSize, "%s", gFirstFailDetail);
         return;
     }
     if (gMessage[0] != '\0') {

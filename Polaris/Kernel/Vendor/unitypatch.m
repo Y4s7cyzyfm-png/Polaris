@@ -597,6 +597,15 @@ uint64_t polaris_find_unity_framework_base(void) {
         return 0;
     }
 
+    // 定位成功：把基址/目标地址/页内偏移都记下来，方便真机排错。
+    // （日志里能一眼看出目标页离基址有多远，以及是否跨了 vm_map_entry）
+    up_set_message("已定位 UnityFramework：base=0x%llx target=0x%llx（偏移 0x%llx，页 0x%llx+0x%llx）",
+                   (unsigned long long)gUnityBase,
+                   (unsigned long long)gTargetAddr,
+                   (unsigned long long)UNITY_PATCH_OFFSET,
+                   (unsigned long long)(gTargetAddr & ~0xFFFULL),
+                   (unsigned long long)(gTargetAddr & 0xFFFULL));
+
     return gUnityBase;
 }
 
@@ -640,7 +649,14 @@ bool polaris_enable_transparent_wall(void) {
         bool ok = false;
         uint32_t current = up_user_read32(gTargetAddr, &ok);
         if (!ok) {
-            up_set_message("目标地址读不到内容，映像可能未加载");
+            // 把 remotepage 记录的**真实失败原因**带出来，
+            // 否则只能瞎猜「映像未加载」——上一版就是这么误判的。
+            char why[192] = {0};
+            polaris_remote_describe(why, (int)sizeof(why));
+            up_set_message("读目标地址 0x%llx 失败（基址 0x%llx）· %s",
+                           (unsigned long long)gTargetAddr,
+                           (unsigned long long)gUnityBase,
+                           why[0] ? why : "无法映射目标页");
             return false;
         }
         if (current == 0) {
