@@ -75,8 +75,11 @@
 /// 环路检测表大小（覆盖正常条目数；溢出后靠 UP_MAX_ENTRIES 兜底）
 #define UP_VISITED_CAP       512
 
-/// 阶段 2 保留的候选映像数量上限（UnityFramework 必然在少数几个大映像里）
-#define UP_MAX_CANDIDATES    16
+/// 阶段 2 保留的候选映像数量上限。
+/// 不按体积裁剪候选——smoba 里有 ~9.8GB 的未知大映射，体积排序会把
+/// 真正的 UnityFramework（280MB）挤出去。全部收下，交给 Mach-O 校验判定。
+/// smoba 里满足「≥8MB 且页对齐」的条目通常在个位数到二十出头。
+#define UP_MAX_CANDIDATES    64
 
 /// 候选映像的最小体积门槛（UnityFramework 约 280MB，普通 framework 远小于此）
 #define UP_CAND_MIN_SIZE     (8ULL * 1024 * 1024)
@@ -85,6 +88,10 @@
 /// 用于在阶段 2 里优先尝试，进一步减少无效探测。
 #define UP_UNITY_HINT_MIN    0x110000000ULL
 #define UP_UNITY_HINT_MAX    0x140000000ULL
+
+/// 「合理库大小」上限。超过此值的映射基本是 Unity 的堆/图形缓冲，
+/// 不可能是 Mach-O 库（UnityFramework 约 280MB）。
+#define UP_LIB_SIZE_MAX      (2ULL * 1024 * 1024 * 1024)
 
 /// 搜索结果缓存（进程重启前有效）
 static uint64_t gUnityBase = 0;
@@ -361,10 +368,11 @@ uint64_t polaris_find_unity_framework_base(void) {
 
     // ── 两阶段策略（降低对游戏内核内存的访问次数，减少反作弊敏感） ──
     //
-    // 阶段 1：只读条目自身的 start/end/size，把「可能承载 UnityFramework」
-    //         的候选记下来（地址落在映像区、且 size 足够大）。
+    // 阶段 1：只读条目自身的 start/end/size，把「可能承载 Mach-O 头」
+    //         的候选记下来（地址落在映像区、且体积够大、且首地址页对齐）。
     //         这一步每个条目只摸 2~3 个字段，不动映像内容。
-    // 阶段 2：只对少数候选做 Mach-O 头校验（每个约 5~10 次读）。
+    // 阶段 2：只对少数候选做 Mach-O 头校验（每个约 5~10 次读），
+    //         且**只接受校验通过的候选**。
     //
     // 对比旧版「看到条目就读 Mach-O」，读次数从 O(条目数 × 10)
     // 降到 O(条目数 × 3 + 候选数 × 10)。
@@ -372,8 +380,6 @@ uint64_t polaris_find_unity_framework_base(void) {
     uint64_t candBase[UP_MAX_CANDIDATES];
     uint64_t candSize[UP_MAX_CANDIDATES];
     int candCount = 0;
-    uint64_t maxDylibBase = 0;   // 备选：最大的映像（未读到库名时用）
-    uint64_t maxDylibSize = 0;
 
     int scanned = 0;
     while (entry != 0 && scanned < UP_MAX_ENTRIES && scanned < (int)nentries + 1) {
@@ -399,13 +405,16 @@ uint64_t polaris_find_unity_framework_base(void) {
         if (okS && okE && up_is_user_pointer(start) && end > start) {
             uint64_t size = end - start;
 
-            // UnityFramework 是超大映像（实测约 280MB），
-            // 远大于普通 framework。用体积门槛快速淘汰小映像。
-            if (size >= UP_CAND_MIN_SIZE) {
-                if (size > maxDylibSize) {
-                    maxDylibSize = size;
-                    maxDylibBase = start;
-                }
+            // 候选筛选条件（三条同时满足才收）：
+            //   1. 体积 >= UP_CAND_MIN_SIZE —— 排除海量小框架/段映射
+            //   2. start 页对齐 —— Mach-O 头必须落在页首，
+            //      能把 __DATA / 堆这类「非页首」的大映射挡在外面
+            //   3. 落在用户态映像窗口（前面已判）
+            //
+            // 注意：这里**不做**「只留最大的几个」这类裁剪，
+            // 否则真目标可能被更大的未知映射挤掉（踩过这个坑）。
+            // 候选全收，由阶段 2 的 Mach-O 校验做最终判定。
+            if (size >= UP_CAND_MIN_SIZE && (start & 0xFFF) == 0) {
                 if (candCount < UP_MAX_CANDIDATES) {
                     candBase[candCount] = start;
                     candSize[candCount] = size;
@@ -419,18 +428,30 @@ uint64_t polaris_find_unity_framework_base(void) {
         entry = next;
     }
 
-    // ── 候选排序：先按「是否落在 UnityFramework 常见映像区间」，
-    //    再按体积降序（UnityFramework 通常是最大那个）。
-    //    排在最前的就是最可能命中的，通常第 1 次探测即中。 ──
+    // ── 候选排序（决定探测顺序，只影响效率不影响正确性） ──
+    //
+    // 排序键（优先级从高到低）：
+    //   1. 是否落在 UnityFramework 常见映像区间 [0x110000000, 0x140000000)
+    //   2. 体积是否在「合理库大小」内（<= 2GB）—— 排除 Unity 的巨型堆映射
+    //   3. 体积降序（UnityFramework 是最大的库）
+    //
+    // 第 2 条是踩坑加的：smoba 有个 ~9.8GB 的映射，单看体积它碾压
+    // 一切；加上「合理库大小」这一档后，它会被推到末尾，第 1 次探测
+    // 就命中真目标的概率大幅提升。
     for (int i = 0; i < candCount; i++) {
         for (int j = i + 1; j < candCount; j++) {
             bool iInHint = (candBase[i] >= UP_UNITY_HINT_MIN && candBase[i] < UP_UNITY_HINT_MAX);
             bool jInHint = (candBase[j] >= UP_UNITY_HINT_MIN && candBase[j] < UP_UNITY_HINT_MAX);
+            bool iSane   = (candSize[i] <= UP_LIB_SIZE_MAX);
+            bool jSane   = (candSize[j] <= UP_LIB_SIZE_MAX);
+
             bool swap;
             if (iInHint != jInHint) {
-                swap = jInHint;                // 区间内的排前面
+                swap = jInHint;                    // 1. 区间内优先
+            } else if (iSane != jSane) {
+                swap = jSane;                      // 2. 合理库大小优先
             } else {
-                swap = candSize[j] > candSize[i]; // 同区间内按体积降序
+                swap = candSize[j] > candSize[i];  // 3. 体积降序
             }
             if (swap) {
                 uint64_t tb = candBase[i], ts = candSize[i];
@@ -441,42 +462,77 @@ uint64_t polaris_find_unity_framework_base(void) {
     }
 
     // ── 阶段 2：对候选做 Mach-O 校验（候选数 ≤ UP_MAX_CANDIDATES） ──
-    uint64_t fallbackBase = 0;  // 备选：校验通过但未读到库名
+    //
+    // 注意：这里只接受「真的被 up_probe_macho 认出是 arm64 Mach-O」的候选。
+    // 曾经有个「校验全失败时退回体积最大的条目」的兜底，那个兜底会返回
+    // **完全未经校验**的地址（smoba 有个 ~9.8GB 的匿名映射，体积碾压
+    // UnityFramework 的 280MB，于是被选中 → 基址错到 0x274000000）。
+    // 宁可明确失败，也不返回未验证的地址。
+    uint64_t fallbackBase = 0;  // 备选：Mach-O 校验通过但没读到库名
     uint64_t fallbackSize = 0;
+    uint64_t maxVerifiedSize = 0;
+    const char *maxVerifiedName = NULL;
+    char maxVerifiedNameBuf[256] = {0};
 
     for (int i = 0; i < candCount; i++) {
         uint32_t filetype = 0;
         char name[256] = {0};
+        // ★ 必须通过 Mach-O 校验，否则这个候选直接作废
         if (!up_probe_macho(candBase[i], &filetype, name, sizeof(name))) continue;
 
-        // 首选：安装名里含 UnityFramework
+        // 首选：安装名里含 UnityFramework（最可靠，直接返回）
         if (strstr(name, "UnityFramework") != NULL) {
             gUnityBase = candBase[i];
             break;
         }
-        // 备选：体积最大的 arm64 dylib
-        if (filetype == MH_DYLIB && candSize[i] > fallbackSize) {
-            fallbackSize = candSize[i];
-            fallbackBase = candBase[i];
+
+        // 备选：记录体积最大的「已校验通过的 arm64 dylib」
+        if (filetype == MH_DYLIB) {
+            if (candSize[i] > fallbackSize) {
+                fallbackSize = candSize[i];
+                fallbackBase = candBase[i];
+            }
+            if (candSize[i] > maxVerifiedSize) {
+                maxVerifiedSize = candSize[i];
+                strlcpy(maxVerifiedNameBuf, name, sizeof(maxVerifiedNameBuf));
+                maxVerifiedName = maxVerifiedNameBuf;
+            }
         }
     }
 
-    // 连候选都没校验出名字时，退回按最大映像定位（旧行为，给用户提示）
-    if (gUnityBase == 0 && fallbackBase == 0 && maxDylibBase != 0) {
-        fallbackBase = maxDylibBase;
+    // 没读到库名时，退回「已通过 Mach-O 校验的最大 dylib」，并在文案里说明
+    if (gUnityBase == 0 && fallbackBase != 0) {
+        gUnityBase = fallbackBase;
+        up_set_message("已定位最大 arm64 映像（%s，未读到库名，请核对）",
+                       maxVerifiedName ? maxVerifiedName : "名称未知");
     }
 
     if (gUnityBase == 0) {
-        if (fallbackBase != 0) {
-            gUnityBase = fallbackBase;
-            up_set_message("已按最大 Mach-O 映像定位基址（未读到库名，请核对）");
-        } else {
-            up_set_message("未找到 UnityFramework 映像，请确认游戏已进入对局");
-            return 0;
-        }
+        up_set_message("未找到 UnityFramework 映像，请确认游戏已进入对局");
+        return 0;
+    }
+
+    // ★ 最终闸门：基址必须落在用户态映像窗口内。
+    // 任何内核地址 / 异常地址在这里被拦下，绝不让它流到写入路径。
+    if (!up_is_user_pointer(gUnityBase)) {
+        uint64_t bad = gUnityBase;
+        gUnityBase = 0;
+        gTargetAddr = 0;
+        up_set_message("定位到的基址越界（0x%llx），已放弃以免写错内存", bad);
+        return 0;
     }
 
     gTargetAddr = gUnityBase + UNITY_PATCH_OFFSET;
+
+    // 目标地址也要做同样的窗口校验（偏移较大，防溢出到内核地址空间）
+    if (!up_is_user_pointer(gTargetAddr)) {
+        uint64_t bad = gTargetAddr;
+        gTargetAddr = 0;
+        gUnityBase = 0;
+        up_set_message("内透目标地址越界（0x%llx），已放弃以免写错内存", bad);
+        return 0;
+    }
+
     return gUnityBase;
 }
 

@@ -167,7 +167,7 @@ open Polaris.xcodeproj   # Xcode 16+ 打开，⌘R 运行（真机 arm64e）
 |---|---|---|
 | `Polaris/SettingsView.swift` | `telegramURL` | `https://t.me/polaris_channel` |
 | `Polaris.xcodeproj/project.pbxproj` | `PRODUCT_BUNDLE_IDENTIFIER`（Debug/Release 两处） | `com.polaris.toolkit` |
-| `codemagic.yaml` | `BUNDLE_ID` / `APP_VERSION` | `com.polaris.toolkit` / `0.4.1` |
+| `codemagic.yaml` | `BUNDLE_ID` / `APP_VERSION` | `com.polaris.toolkit` / `0.4.2` |
 
 > CI 里 `MARKETING_VERSION` 现在取 `${APP_VERSION}`（此前被硬编码成 `0.2.0`，
 > 会导致 pbxproj 里的版本号在 CI 构建时被覆盖——崩溃日志里 `app_version: 0.2.0`
@@ -211,6 +211,7 @@ Polaris/
 
 | 版本 | 变更 |
 |---|---|
+| 0.4.2 | **修复内透定位到错误基址**：去掉「校验失败时退回体积最大条目」的危险兜底（smoba 有个 ~9.8GB 匿名映射，体积碾压 UnityFramework 的 280MB，导致基址错到 `0x274000000`）；阶段 1 增加页对齐筛选，候选上限提到 64 且不再按体积裁剪；排序改为「特征区间 → 合理库大小（≤2GB）→ 体积降序」；新增基址/目标地址的最终窗口闸门，越界即放弃 |
 | 0.4.1 | **修复开启内透导致的 Polaris SIGABRT 崩溃**：`unitypatch.m` 全部内核读取改走 `up_safe_*`（`ds_isvalid` 预检 + `@try/@catch` 兜底），vm_map 遍历加指针守卫 / 环路检测 / 上限；定位改为两阶段候选制，内核读次数大幅下降；CI `MARKETING_VERSION` 不再被硬编码覆盖 |
 | 0.4.0 | 新增「开启内透」开关（King of Glory / UnityFramework 指令补丁，支持开关还原） |
 | 0.3.0 | 新增「获取游戏进程」按钮（`smoba` 主二进制，Rein 同款 `proc_find_by_name`） |
