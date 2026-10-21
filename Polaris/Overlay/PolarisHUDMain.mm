@@ -27,6 +27,7 @@
 #import "PolarisBridge.h"
 #import "PolarisHUDApp.h"
 #import "PolarisHUDAppDelegate.h"
+#import "PolarisHUDKRW.h"
 #import "PolarisHUDLog.h"
 
 // 供 HUDRootVC 读取的 HID 数据（触摸归一化坐标）
