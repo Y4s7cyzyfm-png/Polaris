@@ -18,8 +18,6 @@
 #include <atomic>
 #include <stdlib.h>
 
-extern "C" {
-
 static std::atomic_bool g_hudKrwReady(false);
 
 static int hud_env_int(const char *name, int fallback) {
@@ -32,7 +30,7 @@ static uint64_t hud_env_u64(const char *name) {
     return value && value[0] ? strtoull(value, NULL, 0) : 0;
 }
 
-BOOL PolarisHUDAdoptKRW(void)
+extern "C" BOOL PolarisHUDAdoptKRW(void)
 {
     if (g_hudKrwReady.load()) return YES;
 
@@ -65,9 +63,7 @@ BOOL PolarisHUDAdoptKRW(void)
     return YES;
 }
 
-BOOL PolarisHUDKernelIsReady(void)
+extern "C" BOOL PolarisHUDKernelIsReady(void)
 {
     return g_hudKrwReady.load() && ds_is_ready();
 }
-
-} // extern "C"
