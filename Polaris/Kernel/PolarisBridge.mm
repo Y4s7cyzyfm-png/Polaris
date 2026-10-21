@@ -21,6 +21,7 @@
 
 #include <atomic>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -52,6 +53,69 @@ static NSString *g_gameStatus = @"尚未获取游戏进程";
 
 // 内透（UnityFramework 指令补丁）状态文案
 static NSString *g_wallStatus = @"内透未开启";
+
+// ---------------------------------------------------------------------------
+// RemoteCall（TaskRop）跨进程调用 —— 与 DarkSpeed 同源实现
+// ---------------------------------------------------------------------------
+
+#import "RemoteCall.h"
+
+static NSObject *g_remoteCallsLock = nil;
+static NSMutableDictionary<NSString *, RemoteCall *> *g_remoteCalls = nil;
+
+static RemoteCall *polaris_remote_call_for(NSString *processName) {
+    if (!g_remoteCallsLock) {
+        @synchronized ([NSObject class]) {
+            if (!g_remoteCallsLock) {
+                g_remoteCallsLock = [NSObject new];
+                g_remoteCalls = [NSMutableDictionary dictionary];
+            }
+        }
+    }
+    @synchronized (g_remoteCallsLock) {
+        RemoteCall *call = g_remoteCalls[processName];
+        if (call) return call;
+        call = [[RemoteCall alloc] initWithProcess:processName useMigFilterBypass:NO];
+        if (!call || !call.trojanMem || call.pid <= 1) return nil;
+        g_remoteCalls[processName] = call;
+        return call;
+    }
+}
+
+BOOL PolarisRemoteCallAttach(NSString *processName) {
+    if (!PolarisKernelIsReady()) {
+        polaris_set_error(@"内核未就绪，无法建立 RemoteCall。");
+        polaris_post_progress();
+        return NO;
+    }
+    RemoteCall *call = polaris_remote_call_for(processName);
+    if (!call) {
+        NSString *detail = [RemoteCall lastInitError];
+        polaris_set_error([NSString stringWithFormat:@"RemoteCall 连接 %@ 失败: %@",
+                           processName, detail.length ? detail : @"未知原因"]);
+        polaris_post_progress();
+        return NO;
+    }
+    polaris_set_error(@"");
+    polaris_post_progress();
+    return YES;
+}
+
+NSString *PolarisRemoteCallLastInitError(void) {
+    return [RemoteCall lastInitError] ?: @"";
+}
+
+BOOL PolarisRemoteRead(NSString *processName, uint64_t address, void *buffer, uint64_t size) {
+    RemoteCall *call = polaris_remote_call_for(processName);
+    if (!call) return NO;
+    return [call remoteRead:address to:buffer size:size];
+}
+
+BOOL PolarisRemoteWrite(NSString *processName, uint64_t address, const void *buffer, uint64_t size) {
+    RemoteCall *call = polaris_remote_call_for(processName);
+    if (!call) return NO;
+    return [call remote_write:address from:buffer size:size];
+}
 
 // ---------------------------------------------------------------------------
 // In-app console log ring buffer（功能页「详细日志」视图的数据源）
@@ -697,3 +761,118 @@ void PolarisInitializeDarkSwordKernel(void) {
         }
     });
 }
+
+// ---------------------------------------------------------------------------
+// 悬浮窗（载入悬浮窗按钮）：spawn 自身为 -hud 子进程（网易云 TXNH 架构），
+// KRW 套接字 fd（非 CLOEXEC）+ kbase/kslide 通过环境变量传递，
+// 子进程用 ds_adopt_krw 接管（与 DarkSpeed 的 adopt 链路一致）。
+// ---------------------------------------------------------------------------
+
+#include <spawn.h>
+
+extern "C" char **environ;
+
+#ifndef POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE
+#define POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE 1
+#endif
+extern "C" int posix_spawnattr_set_persona_np(const posix_spawnattr_t *__restrict, uid_t, uint32_t);
+extern "C" int posix_spawnattr_set_persona_uid_np(const posix_spawnattr_t *__restrict, uid_t);
+extern "C" int posix_spawnattr_set_persona_gid_np(const posix_spawnattr_t *__restrict, uid_t);
+
+static std::atomic<int> g_hudPid(0);
+
+BOOL PolarisSpawnHUD(void) {
+    if (!PolarisKernelIsReady()) {
+        polaris_set_error(@"内核未就绪，请先启动内核利用。");
+        polaris_post_progress();
+        return NO;
+    }
+
+    // 已在运行则不重复 spawn
+    if (g_hudPid.load() > 0) {
+        return YES;
+    }
+
+    // 自身可执行文件路径
+    uint32_t size = 0;
+    _NSGetExecutablePath(NULL, &size);
+    char *execPath = (char *)calloc(1, size);
+    _NSGetExecutablePath(execPath, &size);
+    if (!execPath[0]) {
+        free(execPath);
+        polaris_set_error(@"无法定位自身可执行文件路径。");
+        polaris_post_progress();
+        return NO;
+    }
+
+    // KRW 描述符：darksword 套接字在 fork+exec 后依然有效（非 CLOEXEC）。
+    // 内核读写完全由内核侧 socket pcb 驱动，与进程无关——这正是
+    // DarkSpeed 的 DSBridgeAdoptFromEnvironment 同款共享方式。
+    char ctrlFd[16]  = {0};
+    char rwFd[16]    = {0};
+    char kbase[32]   = {0};
+    char kslide[32]  = {0};
+    snprintf(ctrlFd,  sizeof(ctrlFd),  "%d", control_socket);
+    snprintf(rwFd,    sizeof(rwFd),    "%d", rw_socket);
+    snprintf(kbase,   sizeof(kbase),   "0x%llx", (unsigned long long)ds_get_kernel_base());
+    snprintf(kslide,  sizeof(kslide),  "0x%llx", (unsigned long long)ds_get_kernel_slide());
+
+    // 跨进程锁路径（ds_set_xproc_lock_path 同款文件）
+    NSArray<NSString *> *docs =
+        NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *docsPath = docs.firstObject ?: @"";
+
+    setenv("DS_CTRL_FD", ctrlFd, 1);
+    setenv("DS_RW_FD", rwFd, 1);
+    setenv("DS_KBASE", kbase, 1);
+    setenv("DS_KSLIDE", kslide, 1);
+    setenv("DS_HELPER_DOCS", docsPath.fileSystemRepresentation, 1);
+
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+
+    // 网易云 / DarkSpeed / TrollSpeed 同款 persona 提权 spawn：
+    // 自签（非越狱非巨魔）环境内核利用后允许该路径。
+    posix_spawnattr_set_persona_np(&attr, 99, POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE);
+    posix_spawnattr_set_persona_uid_np(&attr, 0);
+    posix_spawnattr_set_persona_gid_np(&attr, 0);
+    posix_spawnattr_setpgroup(&attr, 0);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
+
+    const char *args[] = { execPath, "-hud", NULL };
+    pid_t childPid = 0;
+    int rc = posix_spawn(&childPid, execPath, NULL, &attr, (char **)args, environ);
+    posix_spawnattr_destroy(&attr);
+    free(execPath);
+
+    if (rc != 0) {
+        polaris_set_error([NSString stringWithFormat:@"悬浮窗进程启动失败: %s", strerror(rc)]);
+        polaris_post_progress();
+        return NO;
+    }
+
+    g_hudPid.store((int)childPid);
+    polaris_set_stage([NSString stringWithFormat:@"悬浮窗已载入 (pid %d)", childPid]);
+    polaris_set_error(@"");
+    polaris_post_progress();
+    PB_LOG("spawned HUD process pid=%d", childPid);
+    return YES;
+}
+
+BOOL PolarisHUDIsRunning(void) {
+    int pid = g_hudPid.load();
+    if (pid <= 0) return NO;
+    // 子进程存活检查
+    if (kill((pid_t)pid, 0) == 0) return YES;
+    g_hudPid.store(0);
+    return NO;
+}
+
+BOOL PolarisDismissHUD(void) {
+    int pid = g_hudPid.load();
+    if (pid <= 0) return YES;
+    notify_post("com.polaris.toolkit.overlay.hide");
+    g_hudPid.store(0);
+    return YES;
+}
+

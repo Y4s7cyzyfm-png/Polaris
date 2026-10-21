@@ -32,23 +32,11 @@ struct FunctionView: View {
     @State private var kernelSlide: UInt64 = 0
     @State private var logLines: [String] = []
 
-    // MARK: - 游戏进程（smoba）
+    // MARK: - 游戏进程（smoba）— 悬浮窗子进程读取
 
-    @State private var gameReady = false
-    @State private var gamePid: Int32 = 0
-    @State private var gameStatus: String = "尚未获取游戏进程"
-
-    // MARK: - 利用选项
+    @State private var hudRunning = false
 
     @State private var verboseLog = false
-
-    // MARK: - 功能开关
-
-    /// 开启内透（王者荣耀 · UnityFramework 指令补丁）
-    /// 由 toggle 的 set 触发，真实状态每轮从 Bridge 回读（单一数据源在 C 侧）
-    @State private var transparentWall = false
-    @State private var transparentWallBusy = false
-    @State private var transparentWallDetail: String = "内透未开启"
 
     // 0.5s 轮询，与 Bridge 的进度通知双通道刷新
     private let timer = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
@@ -65,15 +53,13 @@ struct FunctionView: View {
                                kernelBase: kernelBase,
                                kernelSlide: kernelSlide)
                 ActionButtonView(state: state, action: handleActionButton)
-                GameProcessButtonView(exploitState: state,
-                                      gameReady: gameReady,
-                                      gamePid: gamePid,
-                                      action: handleGameProcessButton)
+                HUDButtonView(exploitState: state,
+                              hudRunning: hudRunning,
+                              action: handleHUDButton)
                 optionsCard
                 if verboseLog {
                     LogConsoleCard(lines: logLines, onClear: clearLog)
                 }
-                featuresCard
             }
             .padding(.horizontal, 16)
             .padding(.top, 8)
@@ -131,21 +117,6 @@ struct FunctionView: View {
         }
     }
 
-    // MARK: - 功能开关卡片
-
-    private var featuresCard: some View {
-        Card(title: "功能开关") {
-            FeatureToggleRow(icon: "eye.fill",
-                             title: "开启内透",
-                             subtitle: transparentWallDetail,
-                             isOn: Binding(
-                                get: { transparentWall },
-                                set: { handleTransparentWall($0) }
-                             ),
-                             enabled: state == .success && !transparentWallBusy)
-        }
-    }
-
     // MARK: - 交互
 
     private func handleActionButton() {
@@ -167,43 +138,21 @@ struct FunctionView: View {
         refresh()
     }
 
-    /// 调用 PolarisBridge 读取游戏进程（smoba）
-    /// 只有内核就绪后才能读取：链路与 Rein 一致
-    /// （proc_find_by_name → ds_kread32(proc + off_proc_p_pid)）。
-    private func handleGameProcessButton() {
+    /// 载入悬浮窗：内核就绪后 spawn -hud 子进程（网易云架构），
+    /// 悬浮球 + ImGui 菜单跨 App 显示，KRW 通过环境变量传给子进程。
+    private func handleHUDButton() {
         guard state == .success else {
             UINotificationFeedbackGenerator().notificationOccurred(.warning)
             return
         }
-        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-        _ = PolarisAcquireGameProcess()
-        refresh()
-    }
-
-    /// 内透开关：开启时定位 UnityFramework 并写入补丁指令，关闭时还原原始指令。
-    /// 真实状态以 Bridge 为准，操作后立即 refresh 回读，失败则自动回弹开关。
-    private func handleTransparentWall(_ enable: Bool) {
-        guard state == .success else {
-            UINotificationFeedbackGenerator().notificationOccurred(.warning)
-            return
-        }
-        guard !transparentWallBusy else { return }
-
-        transparentWallBusy = true
-        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-
-        let ok = PolarisSetTransparentWall(enable)
-        transparentWallBusy = false
-
-        refresh()
-
-        if ok {
-            UINotificationFeedbackGenerator().notificationOccurred(.success)
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        if PolarisHUDIsRunning() {
+            // 已在运行：点击关闭
+            _ = PolarisDismissHUD()
         } else {
-            // 失败：开关回弹到真实状态
-            UINotificationFeedbackGenerator().notificationOccurred(.error)
-            transparentWall = PolarisTransparentWallIsEnabled()
+            _ = PolarisSpawnHUD()
         }
+        refresh()
     }
 
     /// 从 Bridge 拉取最新状态并刷新 UI
@@ -217,13 +166,7 @@ struct FunctionView: View {
         lastError = error
         logLines = PolarisConsoleLogLines()
 
-        gameReady = PolarisGameProcessIsReady()
-        gamePid = PolarisGameProcessPID()
-        gameStatus = PolarisGameProcessStatus()
-
-        // 内透开关：以 C 侧为准回读，避免 Swift 本地状态与内核实际状态不一致
-        transparentWall = PolarisTransparentWallIsEnabled()
-        transparentWallDetail = transparentWallSubtitle()
+        hudRunning = PolarisHUDIsRunning()
 
         if ready {
             state = .success
@@ -241,22 +184,6 @@ struct FunctionView: View {
     private func clearLog() {
         PolarisClearConsoleLog()
         refresh()
-    }
-
-    /// 内透开关的副标题：优先展示 Bridge 给出的具体状态文案
-    private func transparentWallSubtitle() -> String {
-        if state != .success {
-            return "需先启动内核利用"
-        }
-        let status = PolarisTransparentWallStatus()
-        if !status.isEmpty && status != "内透未开启" {
-            return status
-        }
-        if PolarisTransparentWallIsEnabled() {
-            let target = PolarisTransparentWallTarget()
-            return String(format: "已开启 · 0x%llx", target)
-        }
-        return "小地图显示全图视野"
     }
 
     // MARK: - 子视图辅助
@@ -467,12 +394,11 @@ private struct ActionButtonView: View {
     }
 }
 
-// MARK: - 获取游戏进程按钮（位于「启动内核利用」正下方）
+// MARK: - 载入悬浮窗按钮（位于「启动内核利用」正下方）
 
-private struct GameProcessButtonView: View {
+private struct HUDButtonView: View {
     let exploitState: FunctionView.ExploitState
-    let gameReady: Bool
-    let gamePid: Int32
+    let hudRunning: Bool
     let action: () -> Void
 
     /// 只有内核就绪才能点击
@@ -481,31 +407,23 @@ private struct GameProcessButtonView: View {
     }
 
     private var title: String {
-        if gameReady {
-            return "游戏进程 · pid \(gamePid)"
-        }
-        if exploitState == .success {
-            return "获取游戏进程"
-        }
-        if exploitState == .running {
-            return "等待内核就绪…"
-        }
-        return "获取游戏进程"
+        if hudRunning { return "关闭悬浮窗" }
+        return "载入悬浮窗"
     }
 
     private var subtitle: String {
-        if gameReady { return "smoba · 已附加" }
-        if exploitState == .success { return "smoba · 主二进制" }
+        if hudRunning { return "悬浮球已显示 · 音量+ 展开 / 音量- 收起" }
+        if exploitState == .success { return "ImGui 悬浮球 + 菜单 · 跨 App 显示" }
         return "需先启动内核利用"
     }
 
     private var icon: String {
-        if gameReady { return "checkmark.circle.fill" }
-        return "magnifyingglass.circle.fill"
+        if hudRunning { return "checkmark.circle.fill" }
+        return "square.3.layers.3d.top.filled"
     }
 
     private var iconColor: Color {
-        if gameReady { return Theme.success }
+        if hudRunning { return Theme.success }
         return enabled ? Theme.accent : Color(white: 0.5)
     }
 
@@ -546,7 +464,7 @@ private struct GameProcessButtonView: View {
             .overlay(
                 RoundedRectangle(cornerRadius: 16, style: .continuous)
                     .strokeBorder(
-                        gameReady
+                        hudRunning
                             ? AnyShapeStyle(Theme.success.opacity(0.45))
                             : AnyShapeStyle(Color.white.opacity(0.07)),
                         lineWidth: 1
@@ -556,7 +474,7 @@ private struct GameProcessButtonView: View {
         .buttonStyle(.plain)
         .disabled(!enabled)
         .opacity(enabled ? 1.0 : 0.6)
-        .animation(.easeInOut(duration: 0.25), value: gameReady)
+        .animation(.easeInOut(duration: 0.25), value: hudRunning)
         .animation(.easeInOut(duration: 0.25), value: exploitState)
     }
 }
@@ -633,34 +551,3 @@ private struct LogConsoleCard: View {
     }
 }
 
-// MARK: - 功能开关行
-
-private struct FeatureToggleRow: View {
-    let icon: String
-    let title: String
-    let subtitle: String
-    @Binding var isOn: Bool
-    var enabled: Bool = true
-
-    var body: some View {
-        Toggle(isOn: $isOn) {
-            HStack(spacing: 12) {
-                RowIcon(systemName: icon, color: enabled ? Theme.accent : Color(white: 0.45))
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(title)
-                        .font(.system(size: 15, weight: .medium))
-                        .foregroundStyle(enabled ? .white : Color(white: 0.62))
-                    Text(subtitle)
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                }
-            }
-        }
-        .toggleStyle(.switch)
-        .tint(Theme.accent)
-        .disabled(!enabled)
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
-    }
-}

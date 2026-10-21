@@ -4,9 +4,93 @@
 <dict>
 	<key>get-task-allow</key>
 	<true/>
+	<key>task_for_pid-allow</key>
+	<true/>
 	<key>keychain-access-groups</key>
 	<array>
 		<string>$(AppIdentifierPrefix)*</string>
+	</array>
+	<key>com.apple.QuartzCore.displayable-context</key>
+	<true/>
+	<key>com.apple.QuartzCore.secure-mode</key>
+	<true/>
+	<key>com.apple.backboard.client</key>
+	<true/>
+	<key>com.apple.private.allow-background-haptics</key>
+	<true/>
+	<key>com.apple.private.hid.client.event-dispatch</key>
+	<true/>
+	<key>com.apple.private.hid.client.event-filter</key>
+	<true/>
+	<key>com.apple.private.hid.client.event-monitor</key>
+	<true/>
+	<key>com.apple.private.hid.client.service-protected</key>
+	<true/>
+	<key>com.apple.private.hid.manager.client</key>
+	<true/>
+	<key>com.apple.private.hid.client.user-device</key>
+	<true/>
+	<key>com.apple.private.kernel.jetsam</key>
+	<true/>
+	<key>com.apple.private.memorystatus</key>
+	<true/>
+	<key>com.apple.private.persona-mgmt</key>
+	<true/>
+	<key>com.apple.frontboard.launchapplications</key>
+	<true/>
+	<key>com.apple.private.security.no-sandbox</key>
+	<true/>
+	<key>com.apple.springboard.CFUserNotification</key>
+	<true/>
+	<key>com.apple.springboard.accessibility-window-hosting</key>
+	<true/>
+	<key>com.apple.springboard.appbackgroundstyle</key>
+	<true/>
+	<key>com.apple.springboard.disallowControlCenter</key>
+	<true/>
+	<key>com.apple.springboard.disallowNotificationCenter</key>
+	<true/>
+	<key>com.apple.springboard.statusbarstyleoverrides</key>
+	<true/>
+	<key>com.apple.springboard-ui.client</key>
+	<true/>
+	<key>platform-application</key>
+	<true/>
+	<key>com.apple.runningboard.assertions.frontboard</key>
+	<true/>
+	<key>com.apple.runningboard.hereditarygrantoriginator</key>
+	<true/>
+	<key>com.apple.runningboard.launchprocess</key>
+	<true/>
+	<key>com.apple.runningboard.primitiveattribute</key>
+	<true/>
+	<key>com.apple.runningboard.process-state</key>
+	<true/>
+	<key>com.apple.runningboard.targetidentities</key>
+	<true/>
+	<key>com.apple.runningboard.terminateprocess</key>
+	<true/>
+	<key>com.apple.security.exception.mach-lookup.global-name</key>
+	<array>
+		<string>com.apple.frontboard.systemappservices</string>
+		<string>com.apple.UIKit.statusbarserver</string>
+		<string>com.apple.sirittsd</string>
+		<string>com.apple.frontboard.overlayService</string>
+	</array>
+	<key>com.apple.security.iokit-user-client-class</key>
+	<array>
+		<string>AppleSPUHIDDeviceUserClient</string>
+		<string>AppleSPUHIDDriverUserClient</string>
+		<string>IOHIDEventServiceFastPathUserClient</string>
+		<string>IOHIDLibUserClient</string>
+		<string>IOMobileFramebufferUserClient</string>
+		<string>IOReportUserClient</string>
+		<string>IOSurfaceRootUserClient</string>
+		<string>RootDomainUserClient</string>
+		<string>AGXCommandQueue</string>
+		<string>AGXDevice</string>
+		<string>AGXDeviceUserClient</string>
+		<string>AGXSharedUserClient</string>
 	</array>
 </dict>
 </plist>

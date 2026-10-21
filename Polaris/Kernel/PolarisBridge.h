@@ -76,9 +76,39 @@ uint64_t PolarisTransparentWallTarget(void);
 /// 内透状态文案。
 NSString *PolarisTransparentWallStatus(void);
 
+// ---------------------------------------------------------------------------
+// 悬浮窗（网易云架构：spawn -hud 子进程 + ImGui 悬浮球/菜单）
+// ---------------------------------------------------------------------------
+
+/// 载入悬浮窗：内核就绪后以 -hud 参数 spawn 自身，跨 App 显示 ImGui 悬浮球/菜单。
+BOOL PolarisSpawnHUD(void);
+
+/// 悬浮窗子进程是否仍在运行。
+BOOL PolarisHUDIsRunning(void);
+
+/// 关闭悬浮窗（notify 子进程退出）。
+BOOL PolarisDismissHUD(void);
+
 // In-app console log ring buffer (also mirrored to Documents/polaris.log).
 NSArray<NSString *> *PolarisConsoleLogLines(void);
 void PolarisClearConsoleLog(void);
+
+// ---------------------------------------------------------------------------
+// RemoteCall（TaskRop，与 DarkSpeed 同源）
+// ---------------------------------------------------------------------------
+
+/// 附加到目标进程建立 RemoteCall（任务线程 ROP 远程调用）。
+/// 内核未就绪或连接失败时返回 NO，原因见 PolarisBridgeLastError()。
+BOOL PolarisRemoteCallAttach(NSString *processName);
+
+/// RemoteCall 最近一次初始化失败的原因（可能为空）。
+NSString *PolarisRemoteCallLastInitError(void);
+
+/// 跨进程读内存。
+BOOL PolarisRemoteRead(NSString *processName, uint64_t address, void *buffer, uint64_t size);
+
+/// 跨进程写内存。
+BOOL PolarisRemoteWrite(NSString *processName, uint64_t address, const void *buffer, uint64_t size);
 
 NS_ASSUME_NONNULL_END
 
