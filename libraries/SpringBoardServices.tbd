@@ -1,12 +1,12 @@
 --- !tapi-tbd
 tbd-version:     4
-targets:         [ arm64-ios, arm64e-ios ]
+targets:         [ armv7-ios, armv7s-ios, arm64-ios, arm64e-ios ]
 install-name:          /System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices
 current-version:       1
 compatibility-version: 1
 objc-constraint:       retain_release
 exports:
-  - archs:                [ armv7, armv7s, arm64, arm64e ]
+  - targets:       [ armv7-ios, armv7s-ios, arm64-ios, arm64e-ios ]
     symbols:              [ _NSStringFromAnalyticsEventType,
                             _NSStringFromAnalyticsQueryName,
                             _NSStringFromSBIdleTimerConfigSettingPrecedence,
