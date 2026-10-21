@@ -4,6 +4,10 @@
 
 #import <Foundation/Foundation.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 NS_ASSUME_NONNULL_BEGIN
 
 /// 采用父进程传来的 KRW（DS_CTRL_FD / DS_RW_FD / DS_KBASE / DS_KSLIDE）。
@@ -14,3 +18,7 @@ BOOL PolarisHUDAdoptKRW(void);
 BOOL PolarisHUDKernelIsReady(void);
 
 NS_ASSUME_NONNULL_END
+
+#ifdef __cplusplus
+}
+#endif

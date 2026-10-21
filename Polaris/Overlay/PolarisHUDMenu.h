@@ -6,6 +6,10 @@
 #import <Foundation/Foundation.h>
 #import "imgui.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 NS_ASSUME_NONNULL_BEGIN
 
 /// 切换菜单显隐（音量+ / 点悬浮球调用）。
@@ -24,3 +28,7 @@ void PolarisMenuRenderBall(float screenW, float screenH);
 void PolarisMenuRender(float screenW, float screenH);
 
 NS_ASSUME_NONNULL_END
+
+#ifdef __cplusplus
+}
+#endif
