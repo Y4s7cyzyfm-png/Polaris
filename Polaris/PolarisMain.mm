@@ -28,13 +28,17 @@ extern int PolarisHUDMainEntry(int argc, char *argv[]);
 
 - (UIViewController *)makeRootVC {
     // SwiftUI 主界面：FunctionView/SettingsView 双 Tab
+    // initWithRootView: 通过 objc_msgSend 调用（UIHostingController 泛型初始化器
+    // 在 instancetype 推导下编译器不认，运行时完全正常）
     Class hostingClass = NSClassFromString(@"UIHostingController");
     NSAssert(hostingClass, @"UIHostingController 不可用");
     Class viewClass = NSClassFromString(@"PolarisMainHostView") ?: NSClassFromString(@"PolarisAppContent");
     NSAssert(viewClass, @"SwiftUI 根视图类缺失");
     id view = ((id (*)(id, SEL))objc_msgSend)((id)viewClass, @selector(alloc));
     view = ((id (*)(id, SEL))objc_msgSend)(view, @selector(init));
-    UIViewController *vc = [[hostingClass alloc] initWithRootView:view];
+    UIViewController *vc = ((UIViewController *(*)(id, SEL, id))objc_msgSend)(
+        ((id (*)(id, SEL))objc_msgSend)((id)hostingClass, @selector(alloc)),
+        @selector(initWithRootView:), view);
     return vc;
 }
 
