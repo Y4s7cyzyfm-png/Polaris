@@ -4,7 +4,6 @@ targets:         [ armv7-ios, armv7s-ios, arm64-ios, arm64e-ios ]
 install-name:          /System/Library/PrivateFrameworks/GraphicsServices.framework/GraphicsServices
 current-version:       14
 compatibility-version: 1
-objc-constraint:       retain_release
 exports:
   - targets:       [ armv7-ios, armv7s-ios, arm64-ios, arm64e-ios ]
     symbols:              [ _GSColorCreateColorWithDeviceRGBA,

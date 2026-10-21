@@ -4,10 +4,8 @@ targets:         [ armv7-ios, armv7s-ios, arm64-ios, arm64e-ios ]
 install-name:          /System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices
 current-version:       1
 compatibility-version: 1
-objc-constraint:       retain_release
 exports:
   - targets:       [ armv7-ios, armv7s-ios, arm64-ios, arm64e-ios ]
-    re-exports:           [ /System/Library/PrivateFrameworks/AssertionServices.framework/AssertionServices ]
     symbols:              [ _BKAccelerometer_server,
                             _BKAccelerometer_server_routine,
                             _BKCreateMIGServerSource,
