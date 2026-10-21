@@ -9,7 +9,7 @@
 #ifndef RemoteCall_h
 #define RemoteCall_h
 
-@import Foundation;
+#import <Foundation/Foundation.h>
 #import <mach/mach.h>
 
 // xnu-10002.81.5/osfmk/kern/exc_guard.h

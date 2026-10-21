@@ -21,6 +21,7 @@
 
 #include <atomic>
 #include <fcntl.h>
+#include <mach-o/dyld.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
@@ -55,68 +56,6 @@ static NSString *g_gameStatus = @"尚未获取游戏进程";
 static NSString *g_wallStatus = @"内透未开启";
 
 // ---------------------------------------------------------------------------
-// RemoteCall（TaskRop）跨进程调用 —— 与 DarkSpeed 同源实现
-// ---------------------------------------------------------------------------
-
-#import "RemoteCall.h"
-
-static NSObject *g_remoteCallsLock = nil;
-static NSMutableDictionary<NSString *, RemoteCall *> *g_remoteCalls = nil;
-
-static RemoteCall *polaris_remote_call_for(NSString *processName) {
-    if (!g_remoteCallsLock) {
-        @synchronized ([NSObject class]) {
-            if (!g_remoteCallsLock) {
-                g_remoteCallsLock = [NSObject new];
-                g_remoteCalls = [NSMutableDictionary dictionary];
-            }
-        }
-    }
-    @synchronized (g_remoteCallsLock) {
-        RemoteCall *call = g_remoteCalls[processName];
-        if (call) return call;
-        call = [[RemoteCall alloc] initWithProcess:processName useMigFilterBypass:NO];
-        if (!call || !call.trojanMem || call.pid <= 1) return nil;
-        g_remoteCalls[processName] = call;
-        return call;
-    }
-}
-
-BOOL PolarisRemoteCallAttach(NSString *processName) {
-    if (!PolarisKernelIsReady()) {
-        polaris_set_error(@"内核未就绪，无法建立 RemoteCall。");
-        polaris_post_progress();
-        return NO;
-    }
-    RemoteCall *call = polaris_remote_call_for(processName);
-    if (!call) {
-        NSString *detail = [RemoteCall lastInitError];
-        polaris_set_error([NSString stringWithFormat:@"RemoteCall 连接 %@ 失败: %@",
-                           processName, detail.length ? detail : @"未知原因"]);
-        polaris_post_progress();
-        return NO;
-    }
-    polaris_set_error(@"");
-    polaris_post_progress();
-    return YES;
-}
-
-NSString *PolarisRemoteCallLastInitError(void) {
-    return [RemoteCall lastInitError] ?: @"";
-}
-
-BOOL PolarisRemoteRead(NSString *processName, uint64_t address, void *buffer, uint64_t size) {
-    RemoteCall *call = polaris_remote_call_for(processName);
-    if (!call) return NO;
-    return [call remoteRead:address to:buffer size:size];
-}
-
-BOOL PolarisRemoteWrite(NSString *processName, uint64_t address, const void *buffer, uint64_t size) {
-    RemoteCall *call = polaris_remote_call_for(processName);
-    if (!call) return NO;
-    return [call remote_write:address from:buffer size:size];
-}
-
 // ---------------------------------------------------------------------------
 // In-app console log ring buffer（功能页「详细日志」视图的数据源）
 // DarkSword 的日志在写 os_log 的同时镜像到这里。
@@ -296,6 +235,69 @@ static void polaris_post_progress(void) {
         [[NSNotificationCenter defaultCenter] postNotificationName:PolarisBridgeProgressNotification object:nil];
     });
 }
+
+// RemoteCall（TaskRop）跨进程调用 —— 与 DarkSpeed 同源实现
+// ---------------------------------------------------------------------------
+
+#import "RemoteCall.h"
+
+static NSObject *g_remoteCallsLock = nil;
+static NSMutableDictionary<NSString *, RemoteCall *> *g_remoteCalls = nil;
+
+static RemoteCall *polaris_remote_call_for(NSString *processName) {
+    if (!g_remoteCallsLock) {
+        @synchronized ([NSObject class]) {
+            if (!g_remoteCallsLock) {
+                g_remoteCallsLock = [NSObject new];
+                g_remoteCalls = [NSMutableDictionary dictionary];
+            }
+        }
+    }
+    @synchronized (g_remoteCallsLock) {
+        RemoteCall *call = g_remoteCalls[processName];
+        if (call) return call;
+        call = [[RemoteCall alloc] initWithProcess:processName useMigFilterBypass:NO];
+        if (!call || !call.trojanMem || call.pid <= 1) return nil;
+        g_remoteCalls[processName] = call;
+        return call;
+    }
+}
+
+BOOL PolarisRemoteCallAttach(NSString *processName) {
+    if (!PolarisKernelIsReady()) {
+        polaris_set_error(@"内核未就绪，无法建立 RemoteCall。");
+        polaris_post_progress();
+        return NO;
+    }
+    RemoteCall *call = polaris_remote_call_for(processName);
+    if (!call) {
+        NSString *detail = [RemoteCall lastInitError];
+        polaris_set_error([NSString stringWithFormat:@"RemoteCall 连接 %@ 失败: %@",
+                           processName, detail.length ? detail : @"未知原因"]);
+        polaris_post_progress();
+        return NO;
+    }
+    polaris_set_error(@"");
+    polaris_post_progress();
+    return YES;
+}
+
+NSString *PolarisRemoteCallLastInitError(void) {
+    return [RemoteCall lastInitError] ?: @"";
+}
+
+BOOL PolarisRemoteRead(NSString *processName, uint64_t address, void *buffer, uint64_t size) {
+    RemoteCall *call = polaris_remote_call_for(processName);
+    if (!call) return NO;
+    return [call remoteRead:address to:buffer size:size];
+}
+
+BOOL PolarisRemoteWrite(NSString *processName, uint64_t address, const void *buffer, uint64_t size) {
+    RemoteCall *call = polaris_remote_call_for(processName);
+    if (!call) return NO;
+    return [call remote_write:address from:buffer size:size];
+}
+
 
 static void polaris_bridge_log(const char *message) {
     if (message && message[0]) {
