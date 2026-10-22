@@ -136,6 +136,10 @@ int disable_excguard_kill(uint64_t task);
 #define RemoteArbCallWithTimeout(timeout, instance, _pc, ...) [instance doRemoteCallStableWithTimeout:timeout functionName:(char *)#_pc functionPointer:(void *)(_pc) args:(uint64_t[]){__VA_ARGS__} argCount:sizeof((uint64_t[]){__VA_ARGS__})/sizeof(uint64_t)]
 #define RemoteArbCall(instance, _pc, ...) RemoteArbCallWithTimeout(5, instance, _pc, __VA_ARGS__)
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 uint64_t remote_alloc_str(RemoteCall *proc, const char *str);
 uint64_t remote_sel(RemoteCall *proc, const char *name);
 uint64_t remote_getClass(RemoteCall *proc, const char *name);
@@ -144,5 +148,9 @@ int remote_errno(RemoteCall *proc);
 uint64_t remote_NSString(RemoteCall *proc, const char *str);
 CGRect remote_getCGRect(RemoteCall *proc, uint64_t obj, uint64_t sel);
 void remote_setCGRect(RemoteCall *proc, uint64_t obj, uint64_t sel, CGRect newRect);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* RemoteCall_h */
