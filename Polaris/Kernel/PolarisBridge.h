@@ -110,6 +110,12 @@ BOOL PolarisRemoteRead(NSString *processName, uint64_t address, void *buffer, ui
 /// 跨进程写内存。
 BOOL PolarisRemoteWrite(NSString *processName, uint64_t address, const void *buffer, uint64_t size);
 
+/// 通过 RemoteCall 让 SpringBoard 代为注册悬浮窗 contextId。
+///
+/// 自签环境本进程缺少 com.apple.springboard.accessibility-window-hosting
+/// 权限，本地调用会被静默丢弃；改由 SpringBoard 用自己的权限注册。
+BOOL PolarisRegisterHUDWindowRemote(uint32_t contextId, double level);
+
 NS_ASSUME_NONNULL_END
 
 #ifdef __cplusplus

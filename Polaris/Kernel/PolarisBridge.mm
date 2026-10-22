@@ -298,6 +298,183 @@ BOOL PolarisRemoteWrite(NSString *processName, uint64_t address, const void *buf
     return [call remote_write:address from:buffer size:size];
 }
 
+// ---------------------------------------------------------------------------
+// RemoteCall 远程方法调用（NSInvocation 方式）
+//
+// remote_msg 只能传 4 个 uint64 整数；double / CGRect 这类走浮点寄存器的
+// 参数传不进去。这里在远程进程里构造 NSInvocation，逐个
+// setArgument:atIndex: 把参数写进远程内存，再同步在主线程 invoke ——
+// 与 DarkSpeed 的 ds_remote_invoke_on_main_result 同源。
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    const void *bytes;
+    uint64_t size;
+} PolarisRemoteArg;
+
+static uint64_t polaris_remote_sel(RemoteCall *proc, const char *name) {
+    if (!proc || !proc.trojanMem || !name) return 0;
+    return remote_sel(proc, name);
+}
+
+static BOOL polaris_perform_on_remote_main(RemoteCall *proc, uint64_t target,
+                                           uint64_t selector, uint64_t argument,
+                                           BOOL waitUntilDone) {
+    if (!proc || !proc.trojanMem || !target || !selector) return NO;
+    uint64_t perform =
+        polaris_remote_sel(proc, "performSelectorOnMainThread:withObject:waitUntilDone:");
+    if (!perform) return NO;
+    remote_msg(proc, target, perform, selector, argument, waitUntilDone ? 1 : 0, 0);
+    return proc.trojanMem != 0;
+}
+
+static BOOL polaris_invoke_on_remote_main_result(RemoteCall *proc, uint64_t target,
+                                                 uint64_t selector,
+                                                 const PolarisRemoteArg *args,
+                                                 NSUInteger argCount,
+                                                 void *result, NSUInteger resultSize) {
+    if (!proc || !target || !selector || !proc.trojanMem) return NO;
+
+    uint64_t poolClass   = remote_getClass(proc, "NSAutoreleasePool");
+    uint64_t selAlloc    = polaris_remote_sel(proc, "alloc");
+    uint64_t selInit     = polaris_remote_sel(proc, "init");
+    uint64_t selDrain    = polaris_remote_sel(proc, "drain");
+    uint64_t pool = (poolClass && selAlloc && selInit && selDrain)
+        ? remote_msg(proc, remote_msg(proc, poolClass, selAlloc, 0, 0, 0, 0),
+                     selInit, 0, 0, 0, 0)
+        : 0;
+    if (!pool) return NO;
+
+    @try {
+        uint64_t signature = remote_msg(proc, target,
+                                        polaris_remote_sel(proc, "methodSignatureForSelector:"),
+                                        selector, 0, 0, 0);
+        if (!proc.trojanMem) return NO;
+
+        uint64_t invocationClass = remote_getClass(proc, "NSInvocation");
+        uint64_t invocation = (signature && invocationClass)
+            ? remote_msg(proc, invocationClass,
+                         polaris_remote_sel(proc, "invocationWithMethodSignature:"),
+                         signature, 0, 0, 0)
+            : 0;
+        if (!invocation || !proc.trojanMem) return NO;
+
+        remote_msg(proc, invocation, polaris_remote_sel(proc, "setTarget:"), target, 0, 0, 0);
+        if (!proc.trojanMem) return NO;
+        remote_msg(proc, invocation, polaris_remote_sel(proc, "setSelector:"), selector, 0, 0, 0);
+        if (!proc.trojanMem) return NO;
+
+        uint64_t scratch = proc.trojanMem + 0x800;
+        for (NSUInteger i = 0; i < argCount; i++) {
+            if (!args[i].bytes || args[i].size == 0 ||
+                ![proc remote_write:scratch from:args[i].bytes size:args[i].size]) {
+                return NO;
+            }
+            remote_msg(proc, invocation,
+                       polaris_remote_sel(proc, "setArgument:atIndex:"),
+                       scratch, i + 2, 0, 0);
+            if (!proc.trojanMem) return NO;
+            scratch += (args[i].size + 15) & ~15ULL;
+        }
+
+        polaris_perform_on_remote_main(proc, invocation,
+                                       polaris_remote_sel(proc, "invoke"), 0, YES);
+        if (!proc.trojanMem) return NO;
+
+        if (result && resultSize > 0) {
+            uint64_t resultScratch = proc.trojanMem + 0xC00;
+            memset(result, 0, resultSize);
+            if (![proc remote_write:resultScratch from:result size:resultSize]) return NO;
+            remote_msg(proc, invocation, polaris_remote_sel(proc, "getReturnValue:"),
+                       resultScratch, 0, 0, 0);
+            if (!proc.trojanMem) return NO;
+            if (![proc remoteRead:resultScratch to:result size:resultSize]) return NO;
+        }
+        return YES;
+    } @finally {
+        if (proc.trojanMem && pool) {
+            remote_msg(proc, pool, selDrain, 0, 0, 0, 0);
+        }
+    }
+}
+
+static BOOL polaris_remote_invoke_noarg_on_main(RemoteCall *proc, uint64_t target,
+                                                const char *selectorName) {
+    return polaris_invoke_on_remote_main_result(
+        proc, target, polaris_remote_sel(proc, selectorName), NULL, 0, NULL, 0);
+}
+
+// ---------------------------------------------------------------------------
+// 让 SpringBoard 代为注册悬浮窗 contextId
+//
+// 自签环境下本进程没有 com.apple.springboard.accessibility-window-hosting
+// 权限，本地调 registerWindowWithContextID: 会被静默丢弃。改由 RemoteCall
+// 进入 SpringBoard 进程，用 SpringBoard 自己的权限去注册——调用者是它自己，
+// 检查自然通过。
+// ---------------------------------------------------------------------------
+
+BOOL PolarisRegisterHUDWindowRemote(uint32_t contextId, double level) {
+    if (!PolarisKernelIsReady()) {
+        polaris_set_error(@"内核未就绪，无法远程注册悬浮窗。");
+        polaris_post_progress();
+        return NO;
+    }
+    if (contextId == 0) {
+        polaris_set_error(@"悬浮窗 contextId 无效 (0)。");
+        polaris_post_progress();
+        return NO;
+    }
+
+    RemoteCall *sb = polaris_remote_call_for(@"SpringBoard");
+    if (!sb) {
+        NSString *detail = [RemoteCall lastInitError];
+        polaris_set_error([NSString stringWithFormat:@"RemoteCall 连接 SpringBoard 失败: %@",
+                           detail.length ? detail : @"未知原因"]);
+        polaris_post_progress();
+        return NO;
+    }
+
+    uint64_t hostingClass = remote_getClass(sb, "SBSAccessibilityWindowHostingController");
+    if (!hostingClass) {
+        polaris_set_error(@"SpringBoard 中没有 SBSAccessibilityWindowHostingController。");
+        polaris_post_progress();
+        return NO;
+    }
+
+    uint64_t instance = remote_msg(sb, hostingClass,
+                                   polaris_remote_sel(sb, "alloc"), 0, 0, 0, 0);
+    instance = remote_msg(sb, instance, polaris_remote_sel(sb, "init"), 0, 0, 0, 0);
+    if (!instance) {
+        polaris_set_error(@"远程创建 SBSAccessibilityWindowHostingController 失败。");
+        polaris_post_progress();
+        return NO;
+    }
+
+    uint32_t ctx = contextId;
+    double lvl = level;
+    PolarisRemoteArg args[] = {
+        { &ctx, sizeof(ctx) },
+        { &lvl, sizeof(lvl) },
+    };
+
+    BOOL ok = polaris_invoke_on_remote_main_result(
+        sb, instance,
+        polaris_remote_sel(sb, "registerWindowWithContextID:atLevel:"),
+        args, 2, NULL, 0);
+
+    if (!ok) {
+        polaris_set_error(@"SpringBoard 远程注册悬浮窗失败。");
+        polaris_post_progress();
+        return NO;
+    }
+
+    PB_LOG("RemoteCall 已在 SpringBoard 注册悬浮窗 ctxId=%u level=%.0f",
+           contextId, level);
+    polaris_set_error(@"");
+    polaris_post_progress();
+    return YES;
+}
+
 
 static void polaris_bridge_log(const char *message) {
     if (message && message[0]) {
@@ -859,6 +1036,70 @@ static BOOL polaris_platformize_self(void)
     return YES;
 }
 
+// ---------------------------------------------------------------------------
+// 悬浮窗 contextId 接力
+//
+// 子进程建好 HUDWindow 后把 _contextId 写进共享容器并 notify；
+// 本函数读出后在主进程用 RemoteCall 让 SpringBoard 代为注册。
+// 之所以绕这一圈：注册接口要求调用方持有
+// com.apple.springboard.accessibility-window-hosting，自签包被剥离，
+// 而 SpringBoard 自己调用必然通过。
+// ---------------------------------------------------------------------------
+
+static void polaris_handle_hud_ctx_file(void)
+{
+    NSArray<NSString *> *docs =
+        NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    if (docs.count == 0) return;
+
+    NSString *path = [docs.firstObject stringByAppendingPathComponent:@"polaris_hud_ctx"];
+    NSString *payload = [NSString stringWithContentsOfFile:path
+                                                  encoding:NSUTF8StringEncoding
+                                                     error:nil];
+    if (payload.length == 0) return;
+
+    NSArray<NSString *> *parts = [payload componentsSeparatedByString:@":"];
+    if (parts.count < 2) return;
+
+    uint32_t ctxId = (uint32_t)strtoul(parts[0].UTF8String, NULL, 10);
+    double level   = strtod(parts[1].UTF8String, NULL);
+    if (ctxId == 0) return;
+
+    PB_LOG("收到悬浮窗 contextId=%u level=%.0f，转交 SpringBoard 注册", ctxId, level);
+
+    if (PolarisRegisterHUDWindowRemote(ctxId, level)) {
+        polaris_set_stage([NSString stringWithFormat:@"悬浮窗已跨 App 显示 (ctx %u)", ctxId]);
+    } else {
+        PB_LOG_ERROR("SpringBoard 远程注册失败: %{public}@", PolarisBridgeLastError());
+    }
+    polaris_post_progress();
+}
+
+static void polaris_start_hud_ctx_observer(void)
+{
+    static std::atomic_bool started(false);
+    bool expected = false;
+    if (!started.compare_exchange_strong(expected, true)) return;
+
+    static dispatch_queue_t queue;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        queue = dispatch_queue_create("com.polaris.hud.ctx", DISPATCH_QUEUE_SERIAL);
+    });
+
+    int token = 0;
+    uint32_t status = notify_register_dispatch("com.polaris.toolkit.hud.ctx",
+                                               &token, queue,
+                                               ^(int t) { polaris_handle_hud_ctx_file(); });
+    if (status != NOTIFY_STATUS_OK) {
+        PB_LOG_ERROR("notify 注册失败 (%u)", status);
+    }
+
+    // 子进程启动需要一两秒，先补一次延时检查兜底（通知丢失时仍能接上）。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                   queue, ^{ polaris_handle_hud_ctx_file(); });
+}
+
 BOOL PolarisSpawnHUD(void) {
     if (!PolarisKernelIsReady()) {
         polaris_set_error(@"内核未就绪，请先启动内核利用。");
@@ -966,6 +1207,9 @@ BOOL PolarisSpawnHUD(void) {
     polaris_set_error(@"");
     polaris_post_progress();
     PB_LOG("spawned HUD process pid=%d", childPid);
+
+    // 子进程建好窗口后会写出 contextId 并发通知，这里起观察者接力注册。
+    polaris_start_hud_ctx_observer();
     return YES;
 }
 

@@ -54,6 +54,20 @@
         PolarisHUDLog(@"  registerWindowWithContextID: SKIPPED! (窗口可能不可见)");
     }
 
+    // ── 把 contextId 交给主进程，由它用 RemoteCall 让 SpringBoard 代为注册 ──
+    // 自签环境下子进程没有 com.apple.springboard.accessibility-window-hosting
+    // 权限，上面那次本地注册大概率被静默丢弃；SpringBoard 自己调用则一定通过。
+    if (ctxId > 0) {
+        NSArray<NSString *> *docs =
+            NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+        NSString *ctxPath = [docs.firstObject stringByAppendingPathComponent:@"polaris_hud_ctx"];
+        NSString *payload = [NSString stringWithFormat:@"%u:%.0f", ctxId, level];
+        [payload writeToFile:ctxPath atomically:YES
+                    encoding:NSUTF8StringEncoding error:nil];
+        PolarisHUDLog(@"  contextId 已写出: %@", payload);
+        notify_post(POLARIS_NOTIF_HUD_CTX);
+    }
+
     // ── 主 App 发送 dismiss 通知时退出悬浮窗进程 ──
     int token;
     notify_register_dispatch(POLARIS_NOTIF_DISMISS, &token, dispatch_get_main_queue(), ^(int t) {
