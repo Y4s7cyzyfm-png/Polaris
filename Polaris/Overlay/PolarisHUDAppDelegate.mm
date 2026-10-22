@@ -16,6 +16,7 @@
 #import <notify.h>
 
 #define POLARIS_NOTIF_DISMISS "com.polaris.toolkit.overlay.hide"
+#define POLARIS_NOTIF_HUD_CTX "com.polaris.toolkit.hud.ctx"
 
 @implementation PolarisHUDAppDelegate {
     SBSAccessibilityWindowHostingController *_hostingController;
