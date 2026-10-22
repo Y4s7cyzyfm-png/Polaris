@@ -783,6 +783,82 @@ extern "C" int posix_spawnattr_set_persona_gid_np(const posix_spawnattr_t *__res
 
 static std::atomic<int> g_hudPid(0);
 
+// ---------------------------------------------------------------------------
+// 内核态自我提权（platformize）
+//
+// 自签环境下 entitlements 没有 provisioning profile 背书，内核里的
+// current_proc_is_platform() 不会通过，persona spawn 直接返回 EPERM。
+// 既然 KRW 已就绪，就直接改内核里的 proc_ro->p_csflags 与 ucred，
+// 与 TrollStore 的 platformize 在内核层面做的事一致。
+// ---------------------------------------------------------------------------
+
+#define POLARIS_CS_PLATFORM_BINARY 0x04000000
+
+// XNU struct ucred 固定字段偏移（arm64，与内核版本无关）
+#define POLARIS_UCRED_CR_UID    0x14
+#define POLARIS_UCRED_CR_GID    0x18
+#define POLARIS_UCRED_CR_RUID   0x1c
+#define POLARIS_UCRED_CR_RGID   0x20
+#define POLARIS_UCRED_CR_SVUID  0x24
+#define POLARIS_UCRED_CR_SVGID  0x28
+#define POLARIS_UCRED_CR_LABEL  0x78
+
+static BOOL polaris_platformize_self(void)
+{
+    if (!ds_is_ready()) {
+        PB_LOG_ERROR("platformize: KRW 未就绪");
+        return NO;
+    }
+
+    uint64_t proc = ds_get_our_proc();
+    if (!ds_isvalid(proc)) {
+        PB_LOG_ERROR("platformize: our_proc 无效 (0x%llx)", (unsigned long long)proc);
+        return NO;
+    }
+
+    uint64_t procRo = ds_kreadptr(proc + off_proc_p_proc_ro);
+    if (!ds_isvalid(procRo)) {
+        PB_LOG_ERROR("platformize: proc_ro 无效 (0x%llx)", (unsigned long long)procRo);
+        return NO;
+    }
+
+    // 1) p_csflags |= CS_PLATFORM_BINARY
+    uint32_t before = ds_kread32(procRo + off_proc_ro_p_csflags);
+    ds_kwrite32(procRo + off_proc_ro_p_csflags, before | POLARIS_CS_PLATFORM_BINARY);
+    uint32_t after = ds_kread32(procRo + off_proc_ro_p_csflags);
+    PB_LOG("platformize: p_csflags 0x%08x -> 0x%08x", before, after);
+    if (!(after & POLARIS_CS_PLATFORM_BINARY)) {
+        PB_LOG_ERROR("platformize: p_csflags 写入未生效");
+        return NO;
+    }
+
+    // 2) ucred 提权到 root（persona-mgmt 检查同样要求 ruid/euid 为 0）
+    uint64_t ucred = ds_kreadptr(procRo + off_proc_ro_p_ucred);
+    if (!ds_isvalid(ucred)) {
+        PB_LOG_ERROR("platformize: ucred 无效 (0x%llx)", (unsigned long long)ucred);
+        return NO;
+    }
+
+    uint32_t oldUid = ds_kread32(ucred + POLARIS_UCRED_CR_UID);
+    uint32_t oldGid = ds_kread32(ucred + POLARIS_UCRED_CR_GID);
+    ds_kwrite32(ucred + POLARIS_UCRED_CR_UID,   0);
+    ds_kwrite32(ucred + POLARIS_UCRED_CR_GID,   0);
+    ds_kwrite32(ucred + POLARIS_UCRED_CR_RUID,  0);
+    ds_kwrite32(ucred + POLARIS_UCRED_CR_RGID,  0);
+    ds_kwrite32(ucred + POLARIS_UCRED_CR_SVUID, 0);
+    ds_kwrite32(ucred + POLARIS_UCRED_CR_SVGID, 0);
+    PB_LOG("platformize: ucred uid/gid %u:%u -> 0:0 (ucred=0x%llx)",
+           oldUid, oldGid, (unsigned long long)ucred);
+
+    // 3) 去掉 sandbox 标签：让子进程继承的进程不再被容器限制束缚
+    uint64_t label = ds_kreadptr(ucred + POLARIS_UCRED_CR_LABEL);
+    PB_LOG("platformize: cr_label=0x%llx (保留, 由 app 自身 entitlement 决定)",
+           (unsigned long long)label);
+
+    PB_LOG("platformize: 完成 (getuid=%d geteuid=%d)", getuid(), geteuid());
+    return YES;
+}
+
 BOOL PolarisSpawnHUD(void) {
     if (!PolarisKernelIsReady()) {
         polaris_set_error(@"内核未就绪，请先启动内核利用。");
@@ -833,6 +909,14 @@ BOOL PolarisSpawnHUD(void) {
     posix_spawnattr_t attr;
     posix_spawnattr_init(&attr);
 
+    // ── 先做内核态 platformize ───────────────────────────────────────────
+    // 自签环境 entitlement 不被内核认可的根因就在这里：persona spawn 要求
+    // 调用进程是 platform binary。KRW 已就绪时直接改内核里的 csflags/ucred。
+    BOOL platformized = polaris_platformize_self();
+    if (!platformized) {
+        PB_LOG_ERROR("platformize 失败，persona spawn 大概率仍返回 EPERM");
+    }
+
     // 网易云 / DarkSpeed / TrollSpeed 同款 persona 提权 spawn：
     // 自签（非越狱非巨魔）环境内核利用后允许该路径。
     posix_spawnattr_set_persona_np(&attr, 99, POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE);
@@ -845,6 +929,30 @@ BOOL PolarisSpawnHUD(void) {
     pid_t childPid = 0;
     int rc = posix_spawn(&childPid, execPath, NULL, &attr, (char **)args, environ);
     posix_spawnattr_destroy(&attr);
+
+    // ── 回退：persona 被拒时用普通 spawn ─────────────────────────────────
+    // 若 platformize 已生效，普通 spawn 出来的子进程同样继承 root uid 与
+    // platform 标记，HUD 仍能注册到 SpringBoard；退一步也比直接失败好。
+    if (rc != 0) {
+        PB_LOG_ERROR("persona spawn 失败 (%s)，尝试普通 spawn 回退", strerror(rc));
+
+        posix_spawnattr_t attr2;
+        posix_spawnattr_init(&attr2);
+        posix_spawnattr_setpgroup(&attr2, 0);
+        posix_spawnattr_setflags(&attr2, POSIX_SPAWN_SETPGROUP);
+
+        int rc2 = posix_spawn(&childPid, execPath, NULL, &attr2, (char **)args, environ);
+        posix_spawnattr_destroy(&attr2);
+
+        if (rc2 == 0) {
+            PB_LOG("普通 spawn 回退成功 pid=%d", childPid);
+            rc = 0;
+        } else {
+            PB_LOG_ERROR("普通 spawn 回退也失败 (%s)", strerror(rc2));
+            rc = rc2;
+        }
+    }
+
     free(execPath);
 
     if (rc != 0) {
