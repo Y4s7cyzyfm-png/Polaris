@@ -38,7 +38,7 @@ void PolarisHIDEventCallback(void *target, void *refcon,
                             IOHIDEventSystemClientRef sender, IOHIDEventRef event);
 
 // 供 ImGuiMetalView 的 DiagLog 弱实现（本工程用 os_log + 环形日志）
-void DiagLog(NSString *fmt, ...);
+extern "C" void DiagLog(NSString *fmt, ...);
 
 int PolarisHUDMainEntry(int argc, char *argv[])
 {
