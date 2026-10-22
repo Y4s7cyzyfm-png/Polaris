@@ -28,18 +28,31 @@ extern int PolarisHUDMainEntry(int argc, char *argv[]);
 
 - (UIViewController *)makeRootVC {
     // SwiftUI 主界面：FunctionView/SettingsView 双 Tab
-    // initWithRootView: 通过 objc_msgSend 调用（UIHostingController 泛型初始化器
-    // 在 instancetype 推导下编译器不认，运行时完全正常）
-    Class hostingClass = NSClassFromString(@"UIHostingController");
-    NSAssert(hostingClass, @"UIHostingController 不可用");
-    Class viewClass = NSClassFromString(@"PolarisMainHostView") ?: NSClassFromString(@"PolarisAppContent");
-    NSAssert(viewClass, @"SwiftUI 根视图类缺失");
-    id view = ((id (*)(id, SEL))objc_msgSend)((id)viewClass, @selector(alloc));
-    view = ((id (*)(id, SEL))objc_msgSend)(view, @selector(init));
-    UIViewController *vc = ((UIViewController *(*)(id, SEL, id))objc_msgSend)(
-        ((id (*)(id, SEL))objc_msgSend)((id)hostingClass, @selector(alloc)),
-        @selector(initWithRootView:), view);
-    return vc;
+    //
+    // SwiftUI 的 View 是 struct，运行时没有 ObjC 类名，NSClassFromString 拿不到，
+    // 因此由 Swift 侧的 PolarisRootPresenter 提供真正的 ObjC 工厂方法。
+    Class presenter = NSClassFromString(@"PolarisRootPresenter");
+    if (presenter) {
+        SEL sel = @selector(makeRootViewController);
+        if ([presenter respondsToSelector:sel]) {
+            UIViewController *vc = ((UIViewController *(*)(id, SEL))objc_msgSend)(presenter, sel);
+            if (vc) return vc;
+        }
+    }
+
+    // 兜底：绝不返回 nil，否则 UIKit 会以
+    // "Application windows are expected to have a root view controller"
+    // 断言直接 abort。
+    UIViewController *fallback = [[UIViewController alloc] init];
+    fallback.view.backgroundColor = [UIColor blackColor];
+    UILabel *label = [[UILabel alloc] initWithFrame:fallback.view.bounds];
+    label.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    label.text = @"界面加载失败：未找到 PolarisRootPresenter";
+    label.textColor = [UIColor whiteColor];
+    label.textAlignment = NSTextAlignmentCenter;
+    label.numberOfLines = 0;
+    [fallback.view addSubview:label];
+    return fallback;
 }
 
 @end
