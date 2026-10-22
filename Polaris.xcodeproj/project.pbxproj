@@ -321,6 +321,14 @@
 					"$(SRCROOT)/libraries/SpringBoardServices.tbd",
 					"$(SRCROOT)/libraries/IOKit.tbd",
 					"$(SRCROOT)/libraries/AssertionServices.tbd",
+					"-framework",
+					"MediaPlayer",
+					"-framework",
+					"MetalKit",
+					"-framework",
+					"Metal",
+					"-framework",
+					"QuartzCore",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.polaris.toolkit;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -381,6 +389,14 @@
 					"$(SRCROOT)/libraries/SpringBoardServices.tbd",
 					"$(SRCROOT)/libraries/IOKit.tbd",
 					"$(SRCROOT)/libraries/AssertionServices.tbd",
+					"-framework",
+					"MediaPlayer",
+					"-framework",
+					"MetalKit",
+					"-framework",
+					"Metal",
+					"-framework",
+					"QuartzCore",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.polaris.toolkit;
 				PRODUCT_NAME = "$(TARGET_NAME)";

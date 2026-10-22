@@ -11,7 +11,9 @@
 #import "PolarisHUDKRW.h"
 #import "PolarisBridge.h"
 
+extern "C" {
 #include "darksword.h"
+}
 #include "offsets.h"
 #include "utils.h"
 

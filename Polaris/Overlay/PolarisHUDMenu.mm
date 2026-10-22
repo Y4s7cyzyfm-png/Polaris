@@ -25,7 +25,6 @@ static float g_ballX = -1.0f, g_ballY = -1.0f;
 // ── 菜单数据（draw 时刷新）──
 static char s_kernelInfo[256] = "";
 static char s_gameInfo[256]   = "";
-static bool s_showDemo = false;
 
 void PolarisMenuToggleVisible(void) { g_menuVisible = !g_menuVisible; }
 void PolarisMenuSetVisible(bool visible) { g_menuVisible = visible; }
@@ -159,7 +158,6 @@ void PolarisMenuRender(float screenW, float screenH)
 
     if (ImGui::CollapsingHeader("关于")) {
         ImGui::TextWrapped("悬浮窗: 音量+ 展开 / 音量- 收起，拖动悬浮球移动位置。");
-        if (ImGui::Checkbox("ImGui Demo", &s_showDemo)) {}
     }
 
     ImGui::Separator();
@@ -169,6 +167,4 @@ void PolarisMenuRender(float screenW, float screenH)
 
     ImGui::End();
     ImGui::PopStyleVar();
-
-    if (s_showDemo) ImGui::ShowDemoWindow();
 }

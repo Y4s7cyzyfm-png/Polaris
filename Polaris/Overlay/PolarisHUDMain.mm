@@ -153,7 +153,7 @@ void PolarisHIDEventCallback(void *target, void *refcon,
     }
 }
 
-void DiagLog(NSString *fmt, ...)
+extern "C" void DiagLog(NSString *fmt, ...)
 {
     va_list args;
     va_start(args, fmt);
